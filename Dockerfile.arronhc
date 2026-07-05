@@ -33,4 +33,4 @@ WORKDIR /new-api
 COPY --from=builder2 /build/new-api .
 COPY --from=builder2 /build/web ./web
 
-ENTRYPOINT ["/new-api"]
+ENTRYPOINT ["/new-api/new-api"]
