@@ -144,6 +144,10 @@ func SetApiRouter(router *gin.Engine) {
 				// Admin 2FA routes
 				adminRoute.GET("/2fa/stats", controller.Admin2FAStats)
 				adminRoute.DELETE("/:id/2fa", controller.AdminDisable2FA)
+
+				// Auto check-in routes
+				adminRoute.GET("/auto-checkin/status", controller.GetAutoCheckinStatus)
+				adminRoute.POST("/auto-checkin/trigger", controller.TriggerAutoCheckin)
 			}
 		}
 
