@@ -273,6 +273,9 @@ func checkinChannel(ctx context.Context, channel Channel, configs map[int]channe
 		return result
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
+	if hasConfig && cfg.UserID != "" {
+		req.Header.Set("New-Api-User", cfg.UserID)
+	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 	req.Header.Set("Accept", "application/json")
 
