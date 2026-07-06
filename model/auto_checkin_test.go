@@ -155,8 +155,8 @@ func TestGetTurnstileTokenExtractsSolutionTokenAndCachesByDomain(t *testing.T) {
 	var upstreamURL string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
-			w.Header().Set("Content-Type", "text/html")
-			_, _ = w.Write([]byte(`<div class="cf-turnstile" data-sitekey="site-key-from-root"></div>`))
+			t.Errorf("upstream root page should not be fetched for sitekey extraction")
+			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 
@@ -176,8 +176,8 @@ func TestGetTurnstileTokenExtractsSolutionTokenAndCachesByDomain(t *testing.T) {
 			require.NoError(t, common.DecodeJson(r.Body, &req))
 			assert.Equal(t, "test-ohmycaptcha-key", req.ClientKey)
 			assert.Equal(t, "TurnstileTaskProxyless", req.Task.Type)
-			assert.Equal(t, upstreamURL+"/", req.Task.WebsiteURL)
-			assert.Equal(t, "site-key-from-root", req.Task.WebsiteKey)
+			assert.Equal(t, upstreamURL+"/profile", req.Task.WebsiteURL)
+			assert.Equal(t, "0x4AAAAAAAJ0j7oRWglsPwXM", req.Task.WebsiteKey)
 
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"errorId":0,"taskId":"task-123"}`))
@@ -215,13 +215,6 @@ func TestGetTurnstileTokenExtractsSolutionTokenAndCachesByDomain(t *testing.T) {
 	assert.Equal(t, 2, getTaskResultCalls)
 }
 
-func TestExtractTurnstileSitekeyFromHTML(t *testing.T) {
-	resetTurnstileTestState(t)
-
-	html := `<main><div data-sitekey='site-key-from-html' class='cf-turnstile'></div></main>`
-	assert.Equal(t, "site-key-from-html", extractTurnstileSitekeyFromHTML(html))
-}
-
 func TestAutoCheckinRetriesPostWithTurnstileToken(t *testing.T) {
 	truncateTables(t)
 	resetTurnstileTestState(t)
@@ -249,8 +242,8 @@ func TestAutoCheckinRetriesPostWithTurnstileToken(t *testing.T) {
 			require.NoError(t, common.DecodeJson(r.Body, &req))
 			assert.Equal(t, "test-ohmycaptcha-key", req.ClientKey)
 			assert.Equal(t, "TurnstileTaskProxyless", req.Task.Type)
-			assert.Equal(t, upstreamURL+"/", req.Task.WebsiteURL)
-			assert.Equal(t, "retry-site-key", req.Task.WebsiteKey)
+			assert.Equal(t, upstreamURL+"/profile", req.Task.WebsiteURL)
+			assert.Equal(t, "0x4AAAAAAAJ0j7oRWglsPwXM", req.Task.WebsiteKey)
 			_, _ = w.Write([]byte(`{"errorId":0,"taskId":"retry-task"}`))
 		case "/getTaskResult":
 			_, _ = w.Write([]byte(`{"errorId":0,"status":"ready","solution":{"token":"retry-token"}}`))
@@ -265,8 +258,8 @@ func TestAutoCheckinRetriesPostWithTurnstileToken(t *testing.T) {
 	var postBodies []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
-			w.Header().Set("Content-Type", "text/html")
-			_, _ = w.Write([]byte(`<div class="cf-turnstile" data-sitekey="retry-site-key"></div>`))
+			t.Errorf("upstream root page should not be fetched for sitekey extraction")
+			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 

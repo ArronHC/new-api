@@ -19,13 +19,13 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
-	"golang.org/x/net/html"
 )
 
 const (
 	autoCheckinTickInterval = time.Minute
 	defaultAutoCheckinCron  = "0 0 * * *"
 	defaultOhMyCaptchaURL   = "http://ohmycaptcha:8000"
+	ohMyCaptchaDummySitekey = "0x4AAAAAAAJ0j7oRWglsPwXM"
 )
 
 type AutoCheckinSummary struct {
@@ -781,19 +781,12 @@ func ohMyCaptchaGetTurnstileToken(ctx context.Context, baseURL string) (string, 
 		return "", errors.New("OHMYCAPTCHA_KEY is not configured")
 	}
 
-	websiteURL, err := rootWebsiteURL(baseURL)
+	websiteURL, err := turnstileWebsiteURL(baseURL)
 	if err != nil {
 		return "", err
-	}
-	sitekey, err := fetchTurnstileSitekey(ctx, websiteURL)
-	if err != nil {
-		return "", err
-	}
-	if sitekey == "" {
-		return "", errors.New("turnstile sitekey not found on upstream root page")
 	}
 
-	taskID, err := ohMyCaptchaCreateTask(ctx, clientKey, websiteURL, sitekey)
+	taskID, err := ohMyCaptchaCreateTask(ctx, clientKey, websiteURL, ohMyCaptchaDummySitekey)
 	if err != nil {
 		return "", err
 	}
@@ -808,7 +801,7 @@ func getOhMyCaptchaURL() string {
 	return baseURL
 }
 
-func rootWebsiteURL(baseURL string) (string, error) {
+func turnstileWebsiteURL(baseURL string) (string, error) {
 	pageURL := strings.TrimRight(strings.TrimSpace(baseURL), "/") + "/"
 	parsedURL, err := neturl.Parse(pageURL)
 	if err != nil {
@@ -817,96 +810,10 @@ func rootWebsiteURL(baseURL string) (string, error) {
 	if parsedURL.Scheme == "" || parsedURL.Host == "" {
 		return "", fmt.Errorf("invalid channel base URL: %s", baseURL)
 	}
-	parsedURL.Path = "/"
+	parsedURL.Path = "/profile"
 	parsedURL.RawQuery = ""
 	parsedURL.Fragment = ""
 	return parsedURL.String(), nil
-}
-
-func fetchTurnstileSitekey(ctx context.Context, websiteURL string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, websiteURL, nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-
-	resp, err := autoCheckinHTTPClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("fetch upstream root page failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
-	if err != nil {
-		return "", err
-	}
-	sitekey := extractTurnstileSitekeyFromHTML(string(body))
-	if sitekey != "" {
-		return sitekey, nil
-	}
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return "", fmt.Errorf("fetch upstream root page returned HTTP %d", resp.StatusCode)
-	}
-	return "", nil
-}
-
-func extractTurnstileSitekeyFromHTML(pageHTML string) string {
-	if strings.TrimSpace(pageHTML) == "" {
-		return ""
-	}
-
-	doc, err := html.Parse(strings.NewReader(pageHTML))
-	if err != nil {
-		return extractTurnstileSitekeyFromText(pageHTML)
-	}
-	var walk func(*html.Node) string
-	walk = func(node *html.Node) string {
-		if node.Type == html.ElementNode {
-			for _, attr := range node.Attr {
-				if strings.EqualFold(attr.Key, "data-sitekey") && strings.TrimSpace(attr.Val) != "" {
-					return strings.TrimSpace(attr.Val)
-				}
-				if strings.EqualFold(attr.Key, "sitekey") && strings.TrimSpace(attr.Val) != "" {
-					return strings.TrimSpace(attr.Val)
-				}
-			}
-		}
-		for child := node.FirstChild; child != nil; child = child.NextSibling {
-			if sitekey := walk(child); sitekey != "" {
-				return sitekey
-			}
-		}
-		return ""
-	}
-	if sitekey := walk(doc); sitekey != "" {
-		return sitekey
-	}
-	return extractTurnstileSitekeyFromText(pageHTML)
-}
-
-func extractTurnstileSitekeyFromText(pageHTML string) string {
-	markers := []string{
-		`data-sitekey="`,
-		`data-sitekey='`,
-		`sitekey: "`,
-		`sitekey: '`,
-		`sitekey="`,
-		`sitekey='`,
-	}
-	for _, marker := range markers {
-		idx := strings.Index(pageHTML, marker)
-		if idx < 0 {
-			continue
-		}
-		start := idx + len(marker)
-		end := strings.IndexAny(pageHTML[start:], `"'`)
-		if end <= 0 || end > 256 {
-			continue
-		}
-		return strings.TrimSpace(pageHTML[start : start+end])
-	}
-	return ""
 }
 
 func ohMyCaptchaCreateTask(ctx context.Context, clientKey, websiteURL, sitekey string) (json.RawMessage, error) {
