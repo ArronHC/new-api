@@ -18,6 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useCallback, useEffect, useState } from 'react'
 import { useForm, type Resolver } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
@@ -101,6 +102,161 @@ function getChannelResultStatus(result: ChannelCheckinResult) {
     labelKey: 'Failed',
     variant: 'danger' as const,
   }
+}
+
+type ChannelInfo = {
+  id: number
+  name: string
+  base_url: string
+  status: number
+}
+
+type ChannelCheckinCfg = {
+  session: string
+  uid: string
+}
+
+function ChannelCheckinConfigCard() {
+  const { t } = useTranslation()
+  const [configs, setConfigs] = useState<Record<string, ChannelCheckinCfg>>({})
+  const [dirty, setDirty] = useState(false)
+
+  const channelsQuery = useQuery({
+    queryKey: ['channels-for-checkin'],
+    queryFn: async () => {
+      const res = await api.get('/api/channel/')
+      return (res.data?.data ?? []) as ChannelInfo[]
+    },
+  })
+
+  const configQuery = useQuery({
+    queryKey: ['checkin-channel-configs'],
+    queryFn: async () => {
+      const res = await api.get('/api/option/')
+      const options = res.data?.data ?? {}
+      const val = options['checkin_channel_configs'] ?? '{}'
+      try {
+        return JSON.parse(typeof val === 'string' ? val : '{}') as Record<
+          string,
+          ChannelCheckinCfg
+        >
+      } catch {
+        return {} as Record<string, ChannelCheckinCfg>
+      }
+    },
+  })
+
+  useEffect(() => {
+    if (configQuery.data) {
+      setConfigs(configQuery.data)
+    }
+  }, [configQuery.data])
+
+  const saveMutation = useMutation({
+    mutationFn: async () => {
+      await api.put('/api/option/', {
+        key: 'checkin_channel_configs',
+        value: JSON.stringify(configs),
+      })
+    },
+    onSuccess: () => {
+      toast.success(t('Saved successfully'))
+      setDirty(false)
+    },
+    onError: () => toast.error(t('Request failed')),
+  })
+
+  const updateConfig = useCallback(
+    (channelId: number, field: keyof ChannelCheckinCfg, value: string) => {
+      setConfigs((prev) => ({
+        ...prev,
+        [String(channelId)]: {
+          ...(prev[String(channelId)] ?? { session: '', uid: '' }),
+          [field]: value,
+        },
+      }))
+      setDirty(true)
+    },
+    []
+  )
+
+  const channels = (channelsQuery.data ?? []).filter(
+    (c) => c.status === 1 && c.base_url
+  )
+
+  if (channels.length === 0) return null
+
+  return (
+    <Card size='sm'>
+      <CardHeader>
+        <CardTitle>{t('Channel Check-in Credentials')}</CardTitle>
+        <CardAction>
+          <Button
+            type='button'
+            size='sm'
+            variant='outline'
+            disabled={!dirty || saveMutation.isPending}
+            onClick={() => saveMutation.mutate()}
+          >
+            {saveMutation.isPending ? t('Saving') : t('Save credentials')}
+          </Button>
+        </CardAction>
+      </CardHeader>
+      <CardContent>
+        <p className='text-muted-foreground mb-3 text-xs'>
+          {t(
+            'Configure upstream session credentials for each channel. Session cookie and UID are needed for the check-in API.'
+          )}
+        </p>
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>{t('Channel')}</TableHead>
+              <TableHead>{t('Session Cookie')}</TableHead>
+              <TableHead>{t('User ID')}</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {channels.map((ch) => {
+              const cfg = configs[String(ch.id)] ?? { session: '', uid: '' }
+              return (
+                <TableRow key={ch.id}>
+                  <TableCell>
+                    <div className='space-y-1'>
+                      <p className='font-medium'>{ch.name}</p>
+                      <p className='text-muted-foreground text-xs'>
+                        {ch.base_url}
+                      </p>
+                    </div>
+                  </TableCell>
+                  <TableCell>
+                    <Input
+                      placeholder='session cookie value'
+                      value={cfg.session}
+                      onChange={(e) =>
+                        updateConfig(ch.id, 'session', e.target.value)
+                      }
+                      className='font-mono text-xs'
+                    />
+                  </TableCell>
+                  <TableCell>
+                    <Input
+                      placeholder='user id'
+                      value={cfg.uid}
+                      onChange={(e) =>
+                        updateConfig(ch.id, 'uid', e.target.value)
+                      }
+                      className='font-mono text-xs'
+                    />
+                  </TableCell>
+                </TableRow>
+              )
+            })}
+          </TableBody>
+        </Table>
+      </CardContent>
+    </Card>
+  )
 }
 
 export function CheckinSettingsSection({
@@ -493,6 +649,8 @@ export function CheckinSettingsSection({
                   </Card>
                 </>
               )}
+
+              <ChannelCheckinConfigCard />
 
             </>
           )}
