@@ -150,58 +150,76 @@ func TestAutoCheckinWithSessionConfig(t *testing.T) {
 func TestGetTurnstileTokenExtractsSolutionTokenAndCachesByDomain(t *testing.T) {
 	resetTurnstileTestState(t)
 
-	var flaresolverrCalls int
-	flaresolverr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet {
-			w.WriteHeader(http.StatusOK)
+	var createTaskCalls int
+	var getTaskResultCalls int
+	var upstreamURL string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte(`<div class="cf-turnstile" data-sitekey="site-key-from-root"></div>`))
 			return
 		}
 
-		flaresolverrCalls++
-		assert.Equal(t, "/v1", r.URL.Path)
 		assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
 
-		var req struct {
-			Cmd        string `json:"cmd"`
-			URL        string `json:"url"`
-			MaxTimeout int    `json:"maxTimeout"`
+		switch r.URL.Path {
+		case "/createTask":
+			createTaskCalls++
+			var req struct {
+				ClientKey string `json:"clientKey"`
+				Task      struct {
+					Type       string `json:"type"`
+					WebsiteURL string `json:"websiteURL"`
+					WebsiteKey string `json:"websiteKey"`
+				} `json:"task"`
+			}
+			require.NoError(t, common.DecodeJson(r.Body, &req))
+			assert.Equal(t, "test-ohmycaptcha-key", req.ClientKey)
+			assert.Equal(t, "TurnstileTaskProxyless", req.Task.Type)
+			assert.Equal(t, upstreamURL+"/", req.Task.WebsiteURL)
+			assert.Equal(t, "site-key-from-root", req.Task.WebsiteKey)
+
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"errorId":0,"taskId":"task-123"}`))
+		case "/getTaskResult":
+			getTaskResultCalls++
+			var req struct {
+				ClientKey string `json:"clientKey"`
+				TaskID    string `json:"taskId"`
+			}
+			require.NoError(t, common.DecodeJson(r.Body, &req))
+			assert.Equal(t, "test-ohmycaptcha-key", req.ClientKey)
+			assert.Equal(t, "task-123", req.TaskID)
+
+			w.Header().Set("Content-Type", "application/json")
+			if getTaskResultCalls == 1 {
+				_, _ = w.Write([]byte(`{"errorId":0,"status":"processing"}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"errorId":0,"status":"ready","solution":{"token":"token-from-ohmycaptcha"}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
 		}
-		require.NoError(t, common.DecodeJson(r.Body, &req))
-		assert.Equal(t, "request.get", req.Cmd)
-		assert.Equal(t, "https://example.com/", req.URL)
-		assert.Equal(t, 60000, req.MaxTimeout)
-
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"ok","solution":{"turnstile_token":"token-from-solution","response":""}}`))
 	}))
-	t.Cleanup(flaresolverr.Close)
-	t.Setenv("FLARESOLVERR_URL", flaresolverr.URL)
+	t.Cleanup(upstream.Close)
+	upstreamURL = upstream.URL
+	t.Setenv("OHMYCAPTCHA_URL", upstream.URL)
+	t.Setenv("OHMYCAPTCHA_KEY", "test-ohmycaptcha-key")
 
-	token := getTurnstileToken(context.Background(), "https://example.com/path")
-	require.Equal(t, "token-from-solution", token)
+	token := getTurnstileToken(context.Background(), upstream.URL+"/api")
+	require.Equal(t, "token-from-ohmycaptcha", token)
 
-	token = getTurnstileToken(context.Background(), "https://example.com/other")
-	require.Equal(t, "token-from-solution", token)
-	assert.Equal(t, 1, flaresolverrCalls)
+	token = getTurnstileToken(context.Background(), upstream.URL+"/other")
+	require.Equal(t, "token-from-ohmycaptcha", token)
+	assert.Equal(t, 1, createTaskCalls)
+	assert.Equal(t, 2, getTaskResultCalls)
 }
 
-func TestGetTurnstileTokenExtractsHTMLFallback(t *testing.T) {
+func TestExtractTurnstileSitekeyFromHTML(t *testing.T) {
 	resetTurnstileTestState(t)
 
-	flaresolverr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"ok","solution":{"response":"<input type=\"hidden\" name=\"cf-turnstile-response\" value=\"token-from-html-response\">"}}`))
-	}))
-	t.Cleanup(flaresolverr.Close)
-	t.Setenv("FLARESOLVERR_URL", flaresolverr.URL)
-
-	token := getTurnstileToken(context.Background(), "https://example.org")
-	assert.Equal(t, "token-from-html-response", token)
+	html := `<main><div data-sitekey='site-key-from-html' class='cf-turnstile'></div></main>`
+	assert.Equal(t, "site-key-from-html", extractTurnstileSitekeyFromHTML(html))
 }
 
 func TestAutoCheckinRetriesPostWithTurnstileToken(t *testing.T) {
@@ -215,20 +233,43 @@ func TestAutoCheckinRetriesPostWithTurnstileToken(t *testing.T) {
 	})
 	setting.Enabled = true
 
-	flaresolverr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
+	var upstreamURL string
+	ohmycaptcha := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"ok","solution":{"turnstile_token":"retry-token"}}`))
+		switch r.URL.Path {
+		case "/createTask":
+			var req struct {
+				ClientKey string `json:"clientKey"`
+				Task      struct {
+					Type       string `json:"type"`
+					WebsiteURL string `json:"websiteURL"`
+					WebsiteKey string `json:"websiteKey"`
+				} `json:"task"`
+			}
+			require.NoError(t, common.DecodeJson(r.Body, &req))
+			assert.Equal(t, "test-ohmycaptcha-key", req.ClientKey)
+			assert.Equal(t, "TurnstileTaskProxyless", req.Task.Type)
+			assert.Equal(t, upstreamURL+"/", req.Task.WebsiteURL)
+			assert.Equal(t, "retry-site-key", req.Task.WebsiteKey)
+			_, _ = w.Write([]byte(`{"errorId":0,"taskId":"retry-task"}`))
+		case "/getTaskResult":
+			_, _ = w.Write([]byte(`{"errorId":0,"status":"ready","solution":{"token":"retry-token"}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
 	}))
-	t.Cleanup(flaresolverr.Close)
-	t.Setenv("FLARESOLVERR_URL", flaresolverr.URL)
+	t.Cleanup(ohmycaptcha.Close)
+	t.Setenv("OHMYCAPTCHA_URL", ohmycaptcha.URL)
+	t.Setenv("OHMYCAPTCHA_KEY", "test-ohmycaptcha-key")
 
 	var postBodies []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte(`<div class="cf-turnstile" data-sitekey="retry-site-key"></div>`))
+			return
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		assert.Equal(t, "Bearer test-token", r.Header.Get("Authorization"))
 
@@ -242,6 +283,7 @@ func TestAutoCheckinRetriesPostWithTurnstileToken(t *testing.T) {
 		postBodies = append(postBodies, string(body))
 
 		if len(postBodies) == 1 {
+			w.WriteHeader(http.StatusForbidden)
 			_, _ = w.Write([]byte(`{"success":false,"message":"Turnstile token 为空"}`))
 			return
 		}
@@ -250,6 +292,7 @@ func TestAutoCheckinRetriesPostWithTurnstileToken(t *testing.T) {
 		_, _ = w.Write([]byte(`{"success":true,"message":"签到成功","data":{"quota_awarded":2468}}`))
 	}))
 	t.Cleanup(upstream.Close)
+	upstreamURL = upstream.URL
 
 	baseURL := upstream.URL
 	require.NoError(t, DB.Create(&Channel{Id: 20, Name: "turnstile", Key: "test-token", BaseURL: &baseURL, Status: common.ChannelStatusEnabled}).Error)

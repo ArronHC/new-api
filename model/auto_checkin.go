@@ -3,6 +3,7 @@ package model
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,11 +19,13 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"golang.org/x/net/html"
 )
 
 const (
 	autoCheckinTickInterval = time.Minute
 	defaultAutoCheckinCron  = "0 0 * * *"
+	defaultOhMyCaptchaURL   = "http://ohmycaptcha:8000"
 )
 
 type AutoCheckinSummary struct {
@@ -69,8 +72,11 @@ var (
 	autoCheckinLastError   string
 	autoCheckinLive        atomic.Bool
 	autoCheckinHTTPClient  = &http.Client{Timeout: 30 * time.Second}
+	ohMyCaptchaHTTPClient  = &http.Client{Timeout: 30 * time.Second}
+	ohMyCaptchaPollEvery   = 2 * time.Second
+	ohMyCaptchaMaxWait     = 90 * time.Second
 
-	// FlareSolverr integration for bypassing Cloudflare Turnstile
+	// FlareSolverr is retained only as a cf_clearance fallback for Cloudflare block pages.
 	flaresolverrURL     string
 	flaresolverrOnce    sync.Once
 	flaresolverrEnabled bool
@@ -88,6 +94,23 @@ type cfClearanceEntry struct {
 type turnstileEntry struct {
 	token     string
 	expiresAt time.Time
+}
+
+type ohMyCaptchaCreateTaskResponse struct {
+	ErrorID          int             `json:"errorId"`
+	ErrorCode        string          `json:"errorCode"`
+	ErrorDescription string          `json:"errorDescription"`
+	TaskID           json.RawMessage `json:"taskId"`
+}
+
+type ohMyCaptchaTaskResultResponse struct {
+	ErrorID          int    `json:"errorId"`
+	ErrorCode        string `json:"errorCode"`
+	ErrorDescription string `json:"errorDescription"`
+	Status           string `json:"status"`
+	Solution         struct {
+		Token string `json:"token"`
+	} `json:"solution"`
 }
 
 var (
@@ -440,7 +463,7 @@ func checkinChannel(ctx context.Context, channel Channel, configs map[int]channe
 	postResult, _, err := doCheckinRequestPost(ctx, checkinURL, token, cfg, hasConfig, baseURL)
 	if err != nil {
 		if isTurnstileEmptyError(err.Error()) {
-			logger.LogInfo(ctx, fmt.Sprintf("Turnstile token required for %s, attempting to obtain via browser automation...", extractDomain(baseURL)))
+			logger.LogInfo(ctx, fmt.Sprintf("Turnstile token required for %s, attempting to obtain via OhMyCaptcha...", extractDomain(baseURL)))
 			turnstileToken := getTurnstileToken(ctx, baseURL)
 			if turnstileToken == "" {
 				result.Error = "Turnstile token required but could not be obtained"
@@ -459,7 +482,7 @@ func checkinChannel(ctx context.Context, channel Channel, configs map[int]channe
 
 	message := strings.TrimSpace(postResult.Message)
 	if isTurnstileEmptyError(message) {
-		logger.LogInfo(ctx, fmt.Sprintf("Turnstile token required for %s, attempting to obtain via browser automation...", extractDomain(baseURL)))
+		logger.LogInfo(ctx, fmt.Sprintf("Turnstile token required for %s, attempting to obtain via OhMyCaptcha...", extractDomain(baseURL)))
 		turnstileToken := getTurnstileToken(ctx, baseURL)
 		if turnstileToken == "" {
 			result.Error = "Turnstile token required but could not be obtained"
@@ -682,8 +705,13 @@ func executeCheckinHTTPWithFlareSolverr(ctx context.Context, url, method, token 
 
 // isCloudflareBlock detects Cloudflare challenge pages in the response.
 func isCloudflareBlock(body []byte, statusCode int) bool {
+	trimmedBody := strings.TrimSpace(string(body))
+	if strings.HasPrefix(trimmedBody, "{") || strings.HasPrefix(trimmedBody, "[") {
+		return false
+	}
+
 	if statusCode == 403 || statusCode == 503 {
-		s := strings.ToLower(string(body))
+		s := strings.ToLower(trimmedBody)
 		if strings.Contains(s, "cf-mitigated") ||
 			strings.Contains(s, "cloudflare") ||
 			strings.Contains(s, "challenge-platform") ||
@@ -696,7 +724,7 @@ func isCloudflareBlock(body []byte, statusCode int) bool {
 	}
 	// Also check for HTML response when JSON was expected
 	if statusCode == 200 {
-		s := strings.ToLower(string(body))
+		s := strings.ToLower(trimmedBody)
 		if strings.Contains(s, "<!doctype html") && (strings.Contains(s, "cloudflare") || strings.Contains(s, "turnstile")) {
 			return true
 		}
@@ -732,122 +760,267 @@ func getTurnstileToken(ctx context.Context, baseURL string) string {
 	}
 	turnstileCacheMu.RUnlock()
 
-	token, err := flaresolverrGetTurnstileToken(ctx, baseURL)
+	token, err := ohMyCaptchaGetTurnstileToken(ctx, baseURL)
 	if err == nil && token != "" {
 		turnstileCacheMu.Lock()
 		turnstileCache[domain] = turnstileEntry{token: token, expiresAt: time.Now().Add(2 * time.Minute)}
 		turnstileCacheMu.Unlock()
-		logger.LogInfo(ctx, fmt.Sprintf("Obtained Turnstile token via FlareSolverr for %s", domain))
+		logger.LogInfo(ctx, fmt.Sprintf("Obtained Turnstile token via OhMyCaptcha for %s", domain))
 		return token
 	}
 	if err != nil {
-		logger.LogInfo(ctx, fmt.Sprintf("FlareSolverr Turnstile extraction failed for %s: %v", domain, err))
+		logger.LogInfo(ctx, fmt.Sprintf("OhMyCaptcha Turnstile solving failed for %s: %v", domain, err))
 	}
 
 	return ""
 }
 
-// flaresolverrGetTurnstileToken uses FlareSolverr to navigate to the base URL
-// and extract the Cloudflare Turnstile token from the rendered page.
-func flaresolverrGetTurnstileToken(ctx context.Context, baseURL string) (string, error) {
-	fsURL := getFlareSolverrURL()
-	if !flaresolverrEnabled {
-		return "", errors.New("FlareSolverr not available")
+func ohMyCaptchaGetTurnstileToken(ctx context.Context, baseURL string) (string, error) {
+	clientKey := strings.TrimSpace(os.Getenv("OHMYCAPTCHA_KEY"))
+	if clientKey == "" {
+		return "", errors.New("OHMYCAPTCHA_KEY is not configured")
 	}
 
-	pageURL := strings.TrimRight(baseURL, "/") + "/"
+	websiteURL, err := rootWebsiteURL(baseURL)
+	if err != nil {
+		return "", err
+	}
+	sitekey, err := fetchTurnstileSitekey(ctx, websiteURL)
+	if err != nil {
+		return "", err
+	}
+	if sitekey == "" {
+		return "", errors.New("turnstile sitekey not found on upstream root page")
+	}
+
+	taskID, err := ohMyCaptchaCreateTask(ctx, clientKey, websiteURL, sitekey)
+	if err != nil {
+		return "", err
+	}
+	return ohMyCaptchaPollTask(ctx, clientKey, taskID)
+}
+
+func getOhMyCaptchaURL() string {
+	baseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("OHMYCAPTCHA_URL")), "/")
+	if baseURL == "" {
+		return defaultOhMyCaptchaURL
+	}
+	return baseURL
+}
+
+func rootWebsiteURL(baseURL string) (string, error) {
+	pageURL := strings.TrimRight(strings.TrimSpace(baseURL), "/") + "/"
 	parsedURL, err := neturl.Parse(pageURL)
 	if err != nil {
 		return "", err
 	}
-	if parsedURL.Scheme != "" && parsedURL.Host != "" {
-		parsedURL.Path = "/"
-		parsedURL.RawQuery = ""
-		parsedURL.Fragment = ""
-		pageURL = parsedURL.String()
+	if parsedURL.Scheme == "" || parsedURL.Host == "" {
+		return "", fmt.Errorf("invalid channel base URL: %s", baseURL)
 	}
+	parsedURL.Path = "/"
+	parsedURL.RawQuery = ""
+	parsedURL.Fragment = ""
+	return parsedURL.String(), nil
+}
 
-	reqBody, err := common.Marshal(map[string]any{
-		"cmd":        "request.get",
-		"url":        pageURL,
-		"maxTimeout": 60000,
-	})
+func fetchTurnstileSitekey(ctx context.Context, websiteURL string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, websiteURL, nil)
 	if err != nil {
 		return "", err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fsURL+"/v1", bytes.NewReader(reqBody))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 
-	resp, err := (&http.Client{Timeout: 90 * time.Second}).Do(req)
+	resp, err := autoCheckinHTTPClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("FlareSolverr request failed: %w", err)
+		return "", fmt.Errorf("fetch upstream root page failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	if err != nil {
 		return "", err
 	}
-
-	var fsResp struct {
-		Status   string `json:"status"`
-		Solution struct {
-			TurnstileToken string `json:"turnstile_token"`
-			Response       string `json:"response"`
-			Status         int    `json:"status"`
-		} `json:"solution"`
-		Message string `json:"message"`
+	sitekey := extractTurnstileSitekeyFromHTML(string(body))
+	if sitekey != "" {
+		return sitekey, nil
 	}
-	if err := common.Unmarshal(respBody, &fsResp); err != nil {
-		return "", fmt.Errorf("FlareSolverr response parse error: %w", err)
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return "", fmt.Errorf("fetch upstream root page returned HTTP %d", resp.StatusCode)
 	}
-	if fsResp.Status != "ok" {
-		return "", fmt.Errorf("FlareSolverr error: %s", fsResp.Message)
-	}
-
-	if fsResp.Solution.TurnstileToken != "" {
-		return fsResp.Solution.TurnstileToken, nil
-	}
-	token := extractTurnstileTokenFromHTML(fsResp.Solution.Response)
-	if token == "" {
-		return "", errors.New("turnstile token not found in FlareSolverr response")
-	}
-	return token, nil
+	return "", nil
 }
 
-// extractTurnstileTokenFromHTML searches for the cf-turnstile-response value in HTML.
-func extractTurnstileTokenFromHTML(html string) string {
-	if html == "" {
+func extractTurnstileSitekeyFromHTML(pageHTML string) string {
+	if strings.TrimSpace(pageHTML) == "" {
 		return ""
 	}
-	// Try multiple patterns
+
+	doc, err := html.Parse(strings.NewReader(pageHTML))
+	if err != nil {
+		return extractTurnstileSitekeyFromText(pageHTML)
+	}
+	var walk func(*html.Node) string
+	walk = func(node *html.Node) string {
+		if node.Type == html.ElementNode {
+			for _, attr := range node.Attr {
+				if strings.EqualFold(attr.Key, "data-sitekey") && strings.TrimSpace(attr.Val) != "" {
+					return strings.TrimSpace(attr.Val)
+				}
+				if strings.EqualFold(attr.Key, "sitekey") && strings.TrimSpace(attr.Val) != "" {
+					return strings.TrimSpace(attr.Val)
+				}
+			}
+		}
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			if sitekey := walk(child); sitekey != "" {
+				return sitekey
+			}
+		}
+		return ""
+	}
+	if sitekey := walk(doc); sitekey != "" {
+		return sitekey
+	}
+	return extractTurnstileSitekeyFromText(pageHTML)
+}
+
+func extractTurnstileSitekeyFromText(pageHTML string) string {
 	markers := []string{
-		`name="cf-turnstile-response" value="`,
-		`name='cf-turnstile-response' value='`,
-		`name=cf-turnstile-response value="`,
-		`data-cf-turnstile-response="`,
+		`data-sitekey="`,
+		`data-sitekey='`,
+		`sitekey: "`,
+		`sitekey: '`,
+		`sitekey="`,
+		`sitekey='`,
 	}
 	for _, marker := range markers {
-		idx := strings.Index(html, marker)
+		idx := strings.Index(pageHTML, marker)
 		if idx < 0 {
 			continue
 		}
 		start := idx + len(marker)
-		end := strings.Index(html[start:], `"`)
-		if end < 0 {
-			end = strings.Index(html[start:], `'`)
+		end := strings.IndexAny(pageHTML[start:], `"'`)
+		if end <= 0 || end > 256 {
+			continue
 		}
-		if end > 0 && end < 512 {
-			token := html[start : start+end]
-			if len(token) > 10 { // Sanity check: Turnstile tokens are long
-				return token
-			}
-		}
+		return strings.TrimSpace(pageHTML[start : start+end])
 	}
 	return ""
+}
+
+func ohMyCaptchaCreateTask(ctx context.Context, clientKey, websiteURL, sitekey string) (json.RawMessage, error) {
+	reqBody, err := common.Marshal(map[string]any{
+		"clientKey": clientKey,
+		"task": map[string]string{
+			"type":       "TurnstileTaskProxyless",
+			"websiteURL": websiteURL,
+			"websiteKey": sitekey,
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, getOhMyCaptchaURL()+"/createTask", bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := ohMyCaptchaHTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("OhMyCaptcha createTask request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("OhMyCaptcha createTask returned HTTP %d", resp.StatusCode)
+	}
+
+	var createResp ohMyCaptchaCreateTaskResponse
+	if err := common.Unmarshal(body, &createResp); err != nil {
+		return nil, fmt.Errorf("OhMyCaptcha createTask response parse error: %w", err)
+	}
+	if createResp.ErrorID != 0 {
+		return nil, fmt.Errorf("OhMyCaptcha createTask error %s: %s", createResp.ErrorCode, createResp.ErrorDescription)
+	}
+	if len(bytes.TrimSpace(createResp.TaskID)) == 0 {
+		return nil, errors.New("OhMyCaptcha createTask returned empty taskId")
+	}
+	return createResp.TaskID, nil
+}
+
+func ohMyCaptchaPollTask(ctx context.Context, clientKey string, taskID json.RawMessage) (string, error) {
+	deadline := time.Now().Add(ohMyCaptchaMaxWait)
+	for {
+		result, err := ohMyCaptchaGetTaskResult(ctx, clientKey, taskID)
+		if err != nil {
+			return "", err
+		}
+		switch strings.ToLower(result.Status) {
+		case "ready":
+			token := strings.TrimSpace(result.Solution.Token)
+			if token == "" {
+				return "", errors.New("OhMyCaptcha returned ready status without token")
+			}
+			return token, nil
+		case "", "processing":
+			if time.Now().After(deadline) {
+				return "", errors.New("OhMyCaptcha task timed out")
+			}
+			timer := time.NewTimer(ohMyCaptchaPollEvery)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return "", ctx.Err()
+			case <-timer.C:
+			}
+		default:
+			return "", fmt.Errorf("OhMyCaptcha task returned unexpected status: %s", result.Status)
+		}
+	}
+}
+
+func ohMyCaptchaGetTaskResult(ctx context.Context, clientKey string, taskID json.RawMessage) (ohMyCaptchaTaskResultResponse, error) {
+	reqBody, err := common.Marshal(map[string]any{
+		"clientKey": clientKey,
+		"taskId":    taskID,
+	})
+	if err != nil {
+		return ohMyCaptchaTaskResultResponse{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, getOhMyCaptchaURL()+"/getTaskResult", bytes.NewReader(reqBody))
+	if err != nil {
+		return ohMyCaptchaTaskResultResponse{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := ohMyCaptchaHTTPClient.Do(req)
+	if err != nil {
+		return ohMyCaptchaTaskResultResponse{}, fmt.Errorf("OhMyCaptcha getTaskResult request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return ohMyCaptchaTaskResultResponse{}, err
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return ohMyCaptchaTaskResultResponse{}, fmt.Errorf("OhMyCaptcha getTaskResult returned HTTP %d", resp.StatusCode)
+	}
+
+	var result ohMyCaptchaTaskResultResponse
+	if err := common.Unmarshal(body, &result); err != nil {
+		return ohMyCaptchaTaskResultResponse{}, fmt.Errorf("OhMyCaptcha getTaskResult response parse error: %w", err)
+	}
+	if result.ErrorID != 0 {
+		return ohMyCaptchaTaskResultResponse{}, fmt.Errorf("OhMyCaptcha getTaskResult error %s: %s", result.ErrorCode, result.ErrorDescription)
+	}
+	return result, nil
 }
 
 func recordAutoCheckinResult(summary *AutoCheckinSummary, err error) {
