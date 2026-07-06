@@ -112,8 +112,8 @@ type ChannelInfo = {
 }
 
 type ChannelCheckinCfg = {
-  session: string
-  uid: string
+  user_id: string
+  access_token: string
 }
 
 function ChannelCheckinConfigCard() {
@@ -176,7 +176,7 @@ function ChannelCheckinConfigCard() {
       setConfigs((prev) => ({
         ...prev,
         [String(channelId)]: {
-          ...(prev[String(channelId)] ?? { session: '', uid: '' }),
+          ...(prev[String(channelId)] ?? { user_id: '', access_token: '' }),
           [field]: value,
         },
       }))
@@ -210,20 +210,20 @@ function ChannelCheckinConfigCard() {
       <CardContent>
         <p className='text-muted-foreground mb-3 text-xs'>
           {t(
-            'Configure upstream session credentials for each channel. Session cookie and UID are needed for the check-in API.'
+            'Configure upstream access credentials for each channel. User ID and access token are needed for the check-in API.'
           )}
         </p>
         <Table>
           <TableHeader>
             <TableRow>
               <TableHead>{t('Channel')}</TableHead>
-              <TableHead>{t('Session Cookie')}</TableHead>
               <TableHead>{t('User ID')}</TableHead>
+              <TableHead>{t('Access Token')}</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {channels.map((ch) => {
-              const cfg = configs[String(ch.id)] ?? { session: '', uid: '' }
+              const cfg = configs[String(ch.id)] ?? { user_id: '', access_token: '' }
               return (
                 <TableRow key={ch.id}>
                   <TableCell>
@@ -236,20 +236,20 @@ function ChannelCheckinConfigCard() {
                   </TableCell>
                   <TableCell>
                     <Input
-                      placeholder='session cookie value'
-                      value={cfg.session}
+                      placeholder='user id'
+                      value={cfg.user_id}
                       onChange={(e) =>
-                        updateConfig(ch.id, 'session', e.target.value)
+                        updateConfig(ch.id, 'user_id', e.target.value)
                       }
                       className='font-mono text-xs'
                     />
                   </TableCell>
                   <TableCell>
                     <Input
-                      placeholder='user id'
-                      value={cfg.uid}
+                      placeholder='access token'
+                      value={cfg.access_token}
                       onChange={(e) =>
-                        updateConfig(ch.id, 'uid', e.target.value)
+                        updateConfig(ch.id, 'access_token', e.target.value)
                       }
                       className='font-mono text-xs'
                     />

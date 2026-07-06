@@ -223,8 +223,8 @@ type upstreamCheckinResponse struct {
 }
 
 type channelCheckinConfig struct {
-	Session string `json:"session"`
-	UID     string `json:"uid"`
+	UserID      string `json:"user_id"`
+	AccessToken string `json:"access_token"`
 }
 
 func loadChannelCheckinConfigs() map[int]channelCheckinConfig {
@@ -260,20 +260,19 @@ func checkinChannel(ctx context.Context, channel Channel, configs map[int]channe
 		return result
 	}
 
-	// Try session-based auth first (Cookie + New-Api-User)
-	cfg, hasSession := configs[channel.Id]
-	if hasSession && cfg.Session != "" && cfg.UID != "" {
-		req.Header.Set("Cookie", "session="+cfg.Session)
-		req.Header.Set("New-Api-User", cfg.UID)
+	// Use access_token from config, fall back to channel key
+	cfg, hasConfig := configs[channel.Id]
+	token := ""
+	if hasConfig && cfg.AccessToken != "" {
+		token = cfg.AccessToken
 	} else {
-		// Fall back to Bearer token
-		key := strings.TrimSpace(channel.Key)
-		if key == "" {
-			result.Error = "no checkin credentials configured and channel key is empty"
-			return result
-		}
-		req.Header.Set("Authorization", "Bearer "+key)
+		token = strings.TrimSpace(channel.Key)
 	}
+	if token == "" {
+		result.Error = "no checkin credentials configured and channel key is empty"
+		return result
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 	req.Header.Set("Accept", "application/json")
 

@@ -105,11 +105,10 @@ func TestAutoCheckinWithSessionConfig(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		cookie := r.Header.Get("Cookie")
-		uid := r.Header.Get("New-Api-User")
+		auth := r.Header.Get("Authorization")
 
 		if r.Method == http.MethodGet {
-			if cookie == "session=test-sess" && uid == "42" {
+			if auth == "Bearer test-token" {
 				_, _ = w.Write([]byte(`{"success":true,"data":{"enabled":true,"stats":{"checked_in_today":false}}}`))
 			} else {
 				w.WriteHeader(http.StatusUnauthorized)
@@ -119,7 +118,7 @@ func TestAutoCheckinWithSessionConfig(t *testing.T) {
 		}
 
 		// POST
-		if cookie == "session=test-sess" && uid == "42" {
+		if auth == "Bearer test-token" {
 			_, _ = w.Write([]byte(`{"success":true,"message":"签到成功","data":{"quota_awarded":5678}}`))
 		} else {
 			w.WriteHeader(http.StatusUnauthorized)
@@ -131,8 +130,8 @@ func TestAutoCheckinWithSessionConfig(t *testing.T) {
 	baseURL := server.URL
 	require.NoError(t, DB.Create(&Channel{Id: 10, Name: "session-test", Key: "unused", BaseURL: &baseURL, Status: common.ChannelStatusEnabled}).Error)
 
-	// Store session config in options
-	require.NoError(t, DB.Create(&Option{Key: "checkin_channel_configs", Value: `{"10":{"session":"test-sess","uid":"42"}}`}).Error)
+	// Store access_token config in options
+	require.NoError(t, DB.Create(&Option{Key: "checkin_channel_configs", Value: `{"10":{"user_id":"42","access_token":"test-token"}}`}).Error)
 
 	summary, err := AutoCheckinAllChannels()
 	require.NoError(t, err)
