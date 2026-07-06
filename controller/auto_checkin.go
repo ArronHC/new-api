@@ -17,9 +17,9 @@ func GetAutoCheckinStatus(c *gin.Context) {
 	})
 }
 
-// TriggerAutoCheckin 手动触发全量自动签到
+// TriggerAutoCheckin 手动触发全量渠道自动签到
 func TriggerAutoCheckin(c *gin.Context) {
-	summary, err := model.TriggerAutoCheckinAllUsers()
+	summary, err := model.TriggerAutoCheckinAllChannels()
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return

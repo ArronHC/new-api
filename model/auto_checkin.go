@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,25 +15,33 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
-	"gorm.io/gorm"
 )
 
 const (
-	autoCheckinBatchSize    = 300
 	autoCheckinTickInterval = time.Minute
 	defaultAutoCheckinCron  = "0 0 * * *"
 )
 
 type AutoCheckinSummary struct {
-	TotalUsers      int    `json:"total_users"`
-	CheckedIn       int    `json:"checked_in"`
-	AlreadyChecked  int    `json:"already_checked"`
-	Failed          int    `json:"failed"`
-	ErrorSamples    []int  `json:"error_samples,omitempty"`
-	StartedAt       int64  `json:"started_at"`
-	FinishedAt      int64  `json:"finished_at"`
-	DurationSeconds int64  `json:"duration_seconds"`
-	Trigger         string `json:"trigger"`
+	TotalChannels          int                    `json:"total_channels"`
+	ChannelsCheckedIn      int                    `json:"channels_checked_in"`
+	ChannelsAlreadyChecked int                    `json:"channels_already_checked"`
+	ChannelsFailed         int                    `json:"channels_failed"`
+	ChannelResults         []ChannelCheckinResult `json:"channel_results"`
+	StartedAt              int64                  `json:"started_at"`
+	FinishedAt             int64                  `json:"finished_at"`
+	DurationSeconds        int64                  `json:"duration_seconds"`
+	Trigger                string                 `json:"trigger"`
+}
+
+type ChannelCheckinResult struct {
+	ChannelID      int    `json:"channel_id"`
+	ChannelName    string `json:"channel_name"`
+	BaseURL         string `json:"base_url"`
+	Success         bool   `json:"success"`
+	QuotaAwarded    int64  `json:"quota_awarded"`
+	Error           string `json:"error,omitempty"`
+	AlreadyChecked  bool   `json:"already_checked"`
 }
 
 type AutoCheckinSchedulerStatus struct {
@@ -55,6 +65,7 @@ var (
 	autoCheckinLastSummary *AutoCheckinSummary
 	autoCheckinLastError   string
 	autoCheckinLive        atomic.Bool
+	autoCheckinHTTPClient  = &http.Client{Timeout: 30 * time.Second}
 )
 
 func StartAutoCheckinScheduler() {
@@ -110,11 +121,11 @@ func AutoCheckinSchedulerStatusSnapshot() AutoCheckinSchedulerStatus {
 	}
 }
 
-func TriggerAutoCheckinAllUsers() (*AutoCheckinSummary, error) {
+func TriggerAutoCheckinAllChannels() (*AutoCheckinSummary, error) {
 	return runAutoCheckin("manual")
 }
 
-func AutoCheckinAllUsers() (*AutoCheckinSummary, error) {
+func AutoCheckinAllChannels() (*AutoCheckinSummary, error) {
 	return runAutoCheckin("auto")
 }
 
@@ -162,33 +173,28 @@ func runAutoCheckin(trigger string) (*AutoCheckinSummary, error) {
 		return summary, err
 	}
 
-	var batchUsers []User
-	err := DB.Model(&User{}).
-		Select("id").
-		Where("status = ?", common.UserStatusEnabled).
+	var channels []Channel
+	err := DB.Model(&Channel{}).
+		Where("status = ?", common.ChannelStatusEnabled).
 		Order("id asc").
-		FindInBatches(&batchUsers, autoCheckinBatchSize, func(tx *gorm.DB, batchNum int) error {
-			for _, user := range batchUsers {
-				summary.TotalUsers++
-				checkin, err := UserCheckin(user.Id)
-				if err != nil {
-					if strings.Contains(err.Error(), "今日已签到") {
-						summary.AlreadyChecked++
-						continue
-					}
-					summary.Failed++
-					if len(summary.ErrorSamples) < 10 {
-						summary.ErrorSamples = append(summary.ErrorSamples, user.Id)
-					}
-					logger.LogWarn(ctx, fmt.Sprintf("auto check-in: user_id=%d failed: %v", user.Id, err))
-					continue
-				}
-				if checkin != nil {
-					summary.CheckedIn++
-				}
+		Find(&channels).Error
+	if err == nil {
+		summary.TotalChannels = len(channels)
+		summary.ChannelResults = make([]ChannelCheckinResult, 0, len(channels))
+		for _, channel := range channels {
+			result := checkinChannel(ctx, channel)
+			summary.ChannelResults = append(summary.ChannelResults, result)
+			switch {
+			case result.AlreadyChecked:
+				summary.ChannelsAlreadyChecked++
+			case result.Success:
+				summary.ChannelsCheckedIn++
+			default:
+				summary.ChannelsFailed++
+				logger.LogWarn(ctx, fmt.Sprintf("auto check-in: channel_id=%d name=%s failed: %s", result.ChannelID, result.ChannelName, result.Error))
 			}
-			return nil
-		}).Error
+		}
+	}
 
 	recordAutoCheckinResult(summary, err)
 	if err != nil {
@@ -197,14 +203,109 @@ func runAutoCheckin(trigger string) (*AutoCheckinSummary, error) {
 	}
 
 	logger.LogInfo(ctx, fmt.Sprintf(
-		"auto check-in completed: trigger=%s total=%d checked_in=%d already_checked=%d failed=%d",
+		"auto check-in completed: trigger=%s total_channels=%d checked_in=%d already_checked=%d failed=%d",
 		trigger,
-		summary.TotalUsers,
-		summary.CheckedIn,
-		summary.AlreadyChecked,
-		summary.Failed,
+		summary.TotalChannels,
+		summary.ChannelsCheckedIn,
+		summary.ChannelsAlreadyChecked,
+		summary.ChannelsFailed,
 	))
 	return summary, nil
+}
+
+type upstreamCheckinResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+	Data    struct {
+		QuotaAwarded int64 `json:"quota_awarded"`
+	} `json:"data"`
+}
+
+func checkinChannel(ctx context.Context, channel Channel) ChannelCheckinResult {
+	baseURL := ""
+	if channel.BaseURL != nil {
+		baseURL = strings.TrimSpace(*channel.BaseURL)
+	}
+	result := ChannelCheckinResult{
+		ChannelID:   channel.Id,
+		ChannelName: channel.Name,
+		BaseURL:      baseURL,
+	}
+
+	if baseURL == "" {
+		result.Error = "channel base URL is empty"
+		return result
+	}
+	key := strings.TrimSpace(channel.Key)
+	if key == "" {
+		result.Error = "channel key is empty"
+		return result
+	}
+
+	checkinURL := strings.TrimRight(baseURL, "/") + "/api/user/checkin"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, checkinURL, nil)
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	req.Header.Set("Authorization", "Bearer "+key)
+
+	resp, err := autoCheckinHTTPClient.Do(req)
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+
+	var upstream upstreamCheckinResponse
+	if len(strings.TrimSpace(string(body))) > 0 {
+		if err := common.Unmarshal(body, &upstream); err != nil {
+			result.Error = fmt.Sprintf("invalid upstream response: %v", err)
+			return result
+		}
+	}
+
+	result.QuotaAwarded = upstream.Data.QuotaAwarded
+	message := strings.TrimSpace(upstream.Message)
+	if isAlreadyCheckedMessage(message) {
+		result.Success = true
+		result.AlreadyChecked = true
+		result.Error = message
+		return result
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		if message == "" {
+			message = resp.Status
+		}
+		result.Error = message
+		return result
+	}
+	if !upstream.Success {
+		if message == "" {
+			message = "upstream check-in failed"
+		}
+		result.Error = message
+		return result
+	}
+
+	result.Success = true
+	return result
+}
+
+func isAlreadyCheckedMessage(message string) bool {
+	message = strings.ToLower(message)
+	return strings.Contains(message, "已经签到") ||
+		strings.Contains(message, "今日已签到") ||
+		strings.Contains(message, "今天已签到") ||
+		strings.Contains(message, "今天已经签到") ||
+		strings.Contains(message, "already checked") ||
+		strings.Contains(message, "already check")
 }
 
 func recordAutoCheckinResult(summary *AutoCheckinSummary, err error) {
@@ -269,4 +370,3 @@ func autoCheckinCronHourMinute(cronExpr string) (int, int, bool) {
 	}
 	return minute, hour, true
 }
-

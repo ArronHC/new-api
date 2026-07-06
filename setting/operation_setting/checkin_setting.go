@@ -4,18 +4,18 @@ import "github.com/QuantumNous/new-api/setting/config"
 
 // CheckinSetting 签到功能配置
 type CheckinSetting struct {
-	Enabled  bool `json:"enabled"`   // 是否启用签到功能
-	MinQuota int  `json:"min_quota"` // 签到最小额度奖励
-	MaxQuota int  `json:"max_quota"` // 签到最大额度奖励
-	AutoCheckinEnabled bool   `json:"auto_checkin_enabled"` // 是否启用自动签到
-	AutoCheckinCron    string `json:"auto_checkin_cron"`    // 自动签到 cron 表达式，格式 "分 时 * * *"
+	Enabled            bool   `json:"enabled"`                // 是否启用签到功能
+	MinQuota           int    `json:"min_quota"`              // 签到最小额度奖励
+	MaxQuota           int    `json:"max_quota"`              // 签到最大额度奖励
+	AutoCheckinEnabled bool   `json:"auto_checkin_enabled"` // 是否启用渠道自动签到
+	AutoCheckinCron    string `json:"auto_checkin_cron"`    // 渠道自动签到 cron 表达式，格式 "分 时 * * *"
 }
 
 // 默认配置
 var checkinSetting = CheckinSetting{
-	Enabled:  false, // 默认关闭
-	MinQuota: 1000,  // 默认最小额度 1000 (约 0.002 USD)
-	MaxQuota: 10000, // 默认最大额度 10000 (约 0.02 USD)
+	Enabled:            false, // 默认关闭
+	MinQuota:           1000,  // 默认最小额度 1000 (约 0.002 USD)
+	MaxQuota:           10000, // 默认最大额度 10000 (约 0.02 USD)
 	AutoCheckinEnabled: false,
 	AutoCheckinCron:    "0 0 * * *", // 默认每天 00:00
 }

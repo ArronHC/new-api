@@ -106,6 +106,53 @@ export type SystemTaskListResponse = {
   data?: SystemTask[]
 }
 
+export type ChannelCheckinResult = {
+  channel_id: number
+  channel_name: string
+  base_url: string
+  success: boolean
+  quota_awarded: number
+  error?: string
+  already_checked: boolean
+}
+
+export type AutoCheckinSummary = {
+  total_channels: number
+  channels_checked_in: number
+  channels_already_checked: number
+  channels_failed: number
+  channel_results: ChannelCheckinResult[]
+  started_at: number
+  finished_at: number
+  duration_seconds: number
+  trigger: string
+}
+
+export type AutoCheckinStatus = {
+  enabled: boolean
+  running: boolean
+  cron: string
+  last_run_date: string
+  last_run_at: number
+  next_run_at: number
+  last_summary?: AutoCheckinSummary
+  last_error?: string
+  scheduler_live: boolean
+  is_master_node: boolean
+}
+
+export type AutoCheckinStatusResponse = {
+  success: boolean
+  data: AutoCheckinStatus
+  message?: string
+}
+
+export type AutoCheckinTriggerResponse = {
+  success: boolean
+  data: AutoCheckinSummary
+  message?: string
+}
+
 export type SiteSettings = {
   'theme.frontend': string
   Notice: string

@@ -43,7 +43,16 @@ import {
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table'
 import { api } from '@/lib/api'
+import { formatQuotaWithCurrency } from '@/lib/currency'
 import dayjs from '@/lib/dayjs'
 
 import {
@@ -54,58 +63,44 @@ import {
 import { SettingsPageFormActions } from '../components/settings-page-context'
 import { SettingsSection } from '../components/settings-section'
 import { useUpdateOption } from '../hooks/use-update-option'
+import type {
+  AutoCheckinStatusResponse,
+  AutoCheckinTriggerResponse,
+  ChannelCheckinResult,
+} from '../types'
 
 const schema = z.object({
   enabled: z.boolean(),
   autoCheckinEnabled: z.boolean(),
   autoCheckinCron: z.string(),
-  minQuota: z.coerce.number().int().min(0),
-  maxQuota: z.coerce.number().int().min(0),
 })
 
 type Values = z.infer<typeof schema>
-
-type AutoCheckinSummary = {
-  total_users: number
-  checked_in: number
-  already_checked: number
-  failed: number
-  started_at: number
-  finished_at: number
-  duration_seconds: number
-  trigger: string
-}
-
-type AutoCheckinStatus = {
-  enabled: boolean
-  running: boolean
-  cron: string
-  last_run_date: string
-  last_run_at: number
-  next_run_at: number
-  last_summary?: AutoCheckinSummary
-  last_error?: string
-  scheduler_live: boolean
-  is_master_node: boolean
-}
-
-type AutoCheckinStatusResponse = {
-  success: boolean
-  data: AutoCheckinStatus
-  message?: string
-}
-
-type AutoCheckinTriggerResponse = {
-  success: boolean
-  data: AutoCheckinSummary
-  message?: string
-}
 
 const AUTO_CHECKIN_STATUS_QUERY_KEY = ['auto-checkin-status'] as const
 
 function formatAutoCheckinTime(timestamp: number | undefined, fallback: string) {
   if (!timestamp) return fallback
   return dayjs.unix(timestamp).format('YYYY-MM-DD HH:mm:ss')
+}
+
+function getChannelResultStatus(result: ChannelCheckinResult) {
+  if (result.already_checked) {
+    return {
+      labelKey: 'Already checked',
+      variant: 'neutral' as const,
+    }
+  }
+  if (result.success) {
+    return {
+      labelKey: 'Success',
+      variant: 'success' as const,
+    }
+  }
+  return {
+    labelKey: 'Failed',
+    variant: 'danger' as const,
+  }
 }
 
 export function CheckinSettingsSection({
@@ -115,8 +110,6 @@ export function CheckinSettingsSection({
     enabled: boolean
     autoCheckinEnabled: boolean
     autoCheckinCron: string
-    minQuota: number
-    maxQuota: number
   }
 }) {
   const { t } = useTranslation()
@@ -129,8 +122,6 @@ export function CheckinSettingsSection({
       enabled: defaultValues.enabled,
       autoCheckinEnabled: defaultValues.autoCheckinEnabled,
       autoCheckinCron: defaultValues.autoCheckinCron || '0 0 * * *',
-      minQuota: defaultValues.minQuota,
-      maxQuota: defaultValues.maxQuota,
     },
   })
 
@@ -195,20 +186,6 @@ export function CheckinSettingsSection({
       })
     }
 
-    if (values.minQuota !== defaultValues.minQuota) {
-      updates.push({
-        key: 'checkin_setting.min_quota',
-        value: String(values.minQuota),
-      })
-    }
-
-    if (values.maxQuota !== defaultValues.maxQuota) {
-      updates.push({
-        key: 'checkin_setting.max_quota',
-        value: String(values.maxQuota),
-      })
-    }
-
     if (updates.length === 0) {
       toast.info(t('No changes to save'))
       return
@@ -240,7 +217,7 @@ export function CheckinSettingsSection({
                   <FormLabel>{t('Enable check-in feature')}</FormLabel>
                   <FormDescription>
                     {t(
-                      'Allow users to check in daily for random quota rewards'
+                      'Check in active upstream channels with each channel API key'
                     )}
                   </FormDescription>
                 </SettingsSwitchContent>
@@ -395,34 +372,34 @@ export function CheckinSettingsSection({
                               <div className='grid gap-3 sm:grid-cols-4'>
                                 <div>
                                   <p className='text-muted-foreground text-xs'>
-                                    {t('Total users')}
+                                    {t('Total channels')}
                                   </p>
                                   <p className='text-sm font-medium'>
                                     {
                                       statusQuery.data.last_summary
-                                        .total_users
+                                        .total_channels
                                     }
                                   </p>
                                 </div>
                                 <div>
                                   <p className='text-muted-foreground text-xs'>
-                                    {t('Checked in')}
+                                    {t('Channels checked in')}
                                   </p>
                                   <p className='text-success text-sm font-medium'>
                                     {
                                       statusQuery.data.last_summary
-                                        .checked_in
+                                        .channels_checked_in
                                     }
                                   </p>
                                 </div>
                                 <div>
                                   <p className='text-muted-foreground text-xs'>
-                                    {t('Already checked')}
+                                    {t('Channels already checked')}
                                   </p>
                                   <p className='text-sm font-medium'>
                                     {
                                       statusQuery.data.last_summary
-                                        .already_checked
+                                        .channels_already_checked
                                     }
                                   </p>
                                 </div>
@@ -432,15 +409,72 @@ export function CheckinSettingsSection({
                                   </p>
                                   <p
                                     className={
-                                      statusQuery.data.last_summary.failed > 0
+                                      statusQuery.data.last_summary
+                                        .channels_failed > 0
                                         ? 'text-destructive text-sm font-medium'
                                         : 'text-success text-sm font-medium'
                                     }
                                   >
-                                    {statusQuery.data.last_summary.failed}
+                                    {
+                                      statusQuery.data.last_summary
+                                        .channels_failed
+                                    }
                                   </p>
                                 </div>
                               </div>
+                              {statusQuery.data.last_summary.channel_results
+                                .length > 0 && (
+                                <Table className='min-w-max'>
+                                  <TableHeader>
+                                    <TableRow>
+                                      <TableHead>{t('Channel')}</TableHead>
+                                      <TableHead>{t('Status')}</TableHead>
+                                      <TableHead>{t('Quota awarded')}</TableHead>
+                                      <TableHead>{t('Error')}</TableHead>
+                                    </TableRow>
+                                  </TableHeader>
+                                  <TableBody>
+                                    {statusQuery.data.last_summary.channel_results.map(
+                                      (result) => {
+                                        const resultStatus =
+                                          getChannelResultStatus(result)
+                                        return (
+                                          <TableRow key={result.channel_id}>
+                                            <TableCell>
+                                              <div className='max-w-64 space-y-1 whitespace-normal'>
+                                                <p className='font-medium'>
+                                                  {result.channel_name ||
+                                                    `#${result.channel_id}`}
+                                                </p>
+                                                <p className='text-muted-foreground break-all text-xs'>
+                                                  {result.base_url}
+                                                </p>
+                                              </div>
+                                            </TableCell>
+                                            <TableCell>
+                                              <StatusBadge
+                                                label={t(
+                                                  resultStatus.labelKey
+                                                )}
+                                                variant={resultStatus.variant}
+                                                copyable={false}
+                                              />
+                                            </TableCell>
+                                            <TableCell>
+                                              {formatQuotaWithCurrency(
+                                                result.quota_awarded
+                                              )}
+                                            </TableCell>
+                                            <TableCell className='max-w-80 whitespace-normal'>
+                                              {result.error || '-'}
+                                            </TableCell>
+                                          </TableRow>
+                                        )
+                                      }
+                                    )}
+                                  </TableBody>
+                                </Table>
+                              )}
                             </div>
                           ) : (
                             <p className='text-muted-foreground text-sm'>
@@ -460,51 +494,6 @@ export function CheckinSettingsSection({
                 </>
               )}
 
-              <div className='grid gap-6 sm:grid-cols-2'>
-                <FormField
-                  control={form.control}
-                  name='minQuota'
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>{t('Minimum check-in quota')}</FormLabel>
-                      <FormControl>
-                        <Input
-                          type='number'
-                          min={0}
-                          placeholder={t('1000')}
-                          {...field}
-                        />
-                      </FormControl>
-                      <FormDescription>
-                        {t('Minimum quota amount awarded for check-in')}
-                      </FormDescription>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-
-                <FormField
-                  control={form.control}
-                  name='maxQuota'
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>{t('Maximum check-in quota')}</FormLabel>
-                      <FormControl>
-                        <Input
-                          type='number'
-                          min={0}
-                          placeholder={t('10000')}
-                          {...field}
-                        />
-                      </FormControl>
-                      <FormDescription>
-                        {t('Maximum quota amount awarded for check-in')}
-                      </FormDescription>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-              </div>
             </>
           )}
         </SettingsForm>
