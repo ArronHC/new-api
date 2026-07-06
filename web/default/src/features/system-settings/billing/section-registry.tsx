@@ -193,9 +193,13 @@ const BILLING_SECTIONS = [
     build: (settings: BillingSettings) => (
       <CheckinSettingsSection
         defaultValues={{
-          enabled: settings['checkin_setting.enabled'],
-          minQuota: settings['checkin_setting.min_quota'],
-          maxQuota: settings['checkin_setting.max_quota'],
+          enabled: settings['checkin_setting.enabled'] ?? false,
+          minQuota: settings['checkin_setting.min_quota'] ?? 0,
+          maxQuota: settings['checkin_setting.max_quota'] ?? 0,
+          autoCheckinEnabled:
+            settings['checkin_setting.auto_checkin_enabled'] ?? false,
+          autoCheckinCron:
+            settings['checkin_setting.auto_checkin_cron'] ?? '0 0 * * *',
         }}
       />
     ),

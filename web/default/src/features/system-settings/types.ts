@@ -327,6 +327,8 @@ export type BillingSettings = {
   'checkin_setting.enabled': boolean
   'checkin_setting.min_quota': number
   'checkin_setting.max_quota': number
+  'checkin_setting.auto_checkin_enabled': boolean
+  'checkin_setting.auto_checkin_cron': string
 }
 
 export type OperationsSettings = {
