@@ -1,9 +1,13 @@
 package model
 
 import (
+	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -34,7 +38,8 @@ func TestAutoCheckinAllChannelsChecksActiveUpstreamChannels(t *testing.T) {
 			if cookie == "session=sess-ok" || auth == "Bearer success-token" {
 				_, _ = w.Write([]byte(`{"success":true,"data":{"enabled":true,"stats":{"checked_in_today":false}}}`))
 			} else if cookie == "session=sess-already" || auth == "Bearer already-token" {
-				_, _ = w.Write([]byte(`{"success":true,"data":{"enabled":true,"stats":{"checked_in_today":true,"records":[{"checkin_date":"2006-01-02","quota_awarded":999}]}}}`))
+				body := `{"success":true,"data":{"enabled":true,"stats":{"checked_in_today":true,"records":[{"checkin_date":"` + time.Now().Format("2006-01-02") + `","quota_awarded":999}]}}}`
+				_, _ = w.Write([]byte(body))
 			} else if auth == "Bearer failed-token" {
 				_, _ = w.Write([]byte(`{"success":true,"data":{"enabled":true,"stats":{"checked_in_today":false}}}`))
 			} else {
@@ -81,12 +86,12 @@ func TestAutoCheckinAllChannelsChecksActiveUpstreamChannels(t *testing.T) {
 		QuotaAwarded: 1234,
 	}, summary.ChannelResults[0])
 	assert.Equal(t, ChannelCheckinResult{
-		ChannelID:     2,
-		ChannelName:   "already",
-		BaseURL:       baseURL,
-		Success:       true,
+		ChannelID:      2,
+		ChannelName:    "already",
+		BaseURL:        baseURL,
+		Success:        true,
 		AlreadyChecked: true,
-		QuotaAwarded:  999,
+		QuotaAwarded:   999,
 	}, summary.ChannelResults[1])
 	assert.Equal(t, 3, summary.ChannelResults[2].ChannelID)
 	assert.False(t, summary.ChannelResults[2].Success)
@@ -140,4 +145,146 @@ func TestAutoCheckinWithSessionConfig(t *testing.T) {
 	require.Len(t, summary.ChannelResults, 1)
 	assert.True(t, summary.ChannelResults[0].Success)
 	assert.Equal(t, int64(5678), summary.ChannelResults[0].QuotaAwarded)
+}
+
+func TestGetTurnstileTokenExtractsSolutionTokenAndCachesByDomain(t *testing.T) {
+	resetTurnstileTestState(t)
+
+	var flaresolverrCalls int
+	flaresolverr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		flaresolverrCalls++
+		assert.Equal(t, "/v1", r.URL.Path)
+		assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
+
+		var req struct {
+			Cmd        string `json:"cmd"`
+			URL        string `json:"url"`
+			MaxTimeout int    `json:"maxTimeout"`
+		}
+		require.NoError(t, common.DecodeJson(r.Body, &req))
+		assert.Equal(t, "request.get", req.Cmd)
+		assert.Equal(t, "https://example.com/", req.URL)
+		assert.Equal(t, 60000, req.MaxTimeout)
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","solution":{"turnstile_token":"token-from-solution","response":""}}`))
+	}))
+	t.Cleanup(flaresolverr.Close)
+	t.Setenv("FLARESOLVERR_URL", flaresolverr.URL)
+
+	token := getTurnstileToken(context.Background(), "https://example.com/path")
+	require.Equal(t, "token-from-solution", token)
+
+	token = getTurnstileToken(context.Background(), "https://example.com/other")
+	require.Equal(t, "token-from-solution", token)
+	assert.Equal(t, 1, flaresolverrCalls)
+}
+
+func TestGetTurnstileTokenExtractsHTMLFallback(t *testing.T) {
+	resetTurnstileTestState(t)
+
+	flaresolverr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","solution":{"response":"<input type=\"hidden\" name=\"cf-turnstile-response\" value=\"token-from-html-response\">"}}`))
+	}))
+	t.Cleanup(flaresolverr.Close)
+	t.Setenv("FLARESOLVERR_URL", flaresolverr.URL)
+
+	token := getTurnstileToken(context.Background(), "https://example.org")
+	assert.Equal(t, "token-from-html-response", token)
+}
+
+func TestAutoCheckinRetriesPostWithTurnstileToken(t *testing.T) {
+	truncateTables(t)
+	resetTurnstileTestState(t)
+
+	setting := operation_setting.GetCheckinSetting()
+	original := *setting
+	t.Cleanup(func() {
+		*setting = original
+	})
+	setting.Enabled = true
+
+	flaresolverr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","solution":{"turnstile_token":"retry-token"}}`))
+	}))
+	t.Cleanup(flaresolverr.Close)
+	t.Setenv("FLARESOLVERR_URL", flaresolverr.URL)
+
+	var postBodies []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		assert.Equal(t, "Bearer test-token", r.Header.Get("Authorization"))
+
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(`{"success":true,"data":{"enabled":true,"stats":{"checked_in_today":false}}}`))
+			return
+		}
+
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		postBodies = append(postBodies, string(body))
+
+		if len(postBodies) == 1 {
+			_, _ = w.Write([]byte(`{"success":false,"message":"Turnstile token 为空"}`))
+			return
+		}
+
+		assert.JSONEq(t, `{"turnstile_token":"retry-token"}`, string(body))
+		_, _ = w.Write([]byte(`{"success":true,"message":"签到成功","data":{"quota_awarded":2468}}`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	baseURL := upstream.URL
+	require.NoError(t, DB.Create(&Channel{Id: 20, Name: "turnstile", Key: "test-token", BaseURL: &baseURL, Status: common.ChannelStatusEnabled}).Error)
+
+	summary, err := AutoCheckinAllChannels()
+	require.NoError(t, err)
+	require.Len(t, summary.ChannelResults, 1)
+	assert.True(t, summary.ChannelResults[0].Success)
+	assert.Equal(t, int64(2468), summary.ChannelResults[0].QuotaAwarded)
+	require.Len(t, postBodies, 2)
+	assert.Empty(t, postBodies[0])
+}
+
+func resetTurnstileTestState(t *testing.T) {
+	t.Helper()
+
+	flaresolverrOnce = sync.Once{}
+	flaresolverrURL = ""
+	flaresolverrEnabled = false
+	turnstileCacheMu.Lock()
+	turnstileCache = make(map[string]turnstileEntry)
+	turnstileCacheMu.Unlock()
+	cfClearanceCacheMu.Lock()
+	cfClearanceCache = make(map[string]cfClearanceEntry)
+	cfClearanceCacheMu.Unlock()
+
+	t.Cleanup(func() {
+		flaresolverrOnce = sync.Once{}
+		flaresolverrURL = ""
+		flaresolverrEnabled = false
+		turnstileCacheMu.Lock()
+		turnstileCache = make(map[string]turnstileEntry)
+		turnstileCacheMu.Unlock()
+		cfClearanceCacheMu.Lock()
+		cfClearanceCache = make(map[string]cfClearanceEntry)
+		cfClearanceCacheMu.Unlock()
+	})
 }

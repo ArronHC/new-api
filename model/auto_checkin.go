@@ -1,11 +1,13 @@
 package model
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -38,24 +40,24 @@ type AutoCheckinSummary struct {
 type ChannelCheckinResult struct {
 	ChannelID      int    `json:"channel_id"`
 	ChannelName    string `json:"channel_name"`
-	BaseURL         string `json:"base_url"`
-	Success         bool   `json:"success"`
-	QuotaAwarded    int64  `json:"quota_awarded"`
-	Error           string `json:"error,omitempty"`
-	AlreadyChecked  bool   `json:"already_checked"`
+	BaseURL        string `json:"base_url"`
+	Success        bool   `json:"success"`
+	QuotaAwarded   int64  `json:"quota_awarded"`
+	Error          string `json:"error,omitempty"`
+	AlreadyChecked bool   `json:"already_checked"`
 }
 
 type AutoCheckinSchedulerStatus struct {
-	Enabled       bool                 `json:"enabled"`
-	Running       bool                 `json:"running"`
-	Cron          string               `json:"cron"`
-	LastRunDate   string               `json:"last_run_date"`
-	LastRunAt     int64                `json:"last_run_at"`
-	NextRunAt     int64                `json:"next_run_at"`
-	LastSummary   *AutoCheckinSummary  `json:"last_summary,omitempty"`
-	LastError     string               `json:"last_error,omitempty"`
-	SchedulerLive bool                 `json:"scheduler_live"`
-	IsMasterNode  bool                 `json:"is_master_node"`
+	Enabled       bool                `json:"enabled"`
+	Running       bool                `json:"running"`
+	Cron          string              `json:"cron"`
+	LastRunDate   string              `json:"last_run_date"`
+	LastRunAt     int64               `json:"last_run_at"`
+	NextRunAt     int64               `json:"next_run_at"`
+	LastSummary   *AutoCheckinSummary `json:"last_summary,omitempty"`
+	LastError     string              `json:"last_error,omitempty"`
+	SchedulerLive bool                `json:"scheduler_live"`
+	IsMasterNode  bool                `json:"is_master_node"`
 }
 
 var (
@@ -82,6 +84,16 @@ type cfClearanceEntry struct {
 	userAgent string
 	expiresAt time.Time
 }
+
+type turnstileEntry struct {
+	token     string
+	expiresAt time.Time
+}
+
+var (
+	turnstileCache   = make(map[string]turnstileEntry)
+	turnstileCacheMu sync.RWMutex
+)
 
 func getFlareSolverrURL() string {
 	flaresolverrOnce.Do(func() {
@@ -124,8 +136,15 @@ func flaresolverrSolve(ctx context.Context, targetURL string) (*cfClearanceEntry
 	}
 	cfClearanceCacheMu.RUnlock()
 
-	reqBody := fmt.Sprintf(`{"cmd":"request.get","url":"%s","maxTimeout":60000}`, targetURL)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fsURL+"/v1", strings.NewReader(reqBody))
+	reqBody, err := common.Marshal(map[string]any{
+		"cmd":        "request.get",
+		"url":        targetURL,
+		"maxTimeout": 60000,
+	})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fsURL+"/v1", bytes.NewReader(reqBody))
 	if err != nil {
 		return nil, err
 	}
@@ -144,10 +163,10 @@ func flaresolverrSolve(ctx context.Context, targetURL string) (*cfClearanceEntry
 
 	// Parse FlareSolverr response for cookies
 	var fsResp struct {
-		Status string `json:"status"`
+		Status   string `json:"status"`
 		Solution struct {
-			Headers    map[string]string `json:"headers"`
-			Cookies    []struct {
+			Headers map[string]string `json:"headers"`
+			Cookies []struct {
 				Name  string `json:"name"`
 				Value string `json:"value"`
 			} `json:"cookies"`
@@ -420,11 +439,39 @@ func checkinChannel(ctx context.Context, channel Channel, configs map[int]channe
 	// Not checked in yet, do POST checkin
 	postResult, _, err := doCheckinRequestPost(ctx, checkinURL, token, cfg, hasConfig, baseURL)
 	if err != nil {
-		result.Error = err.Error()
-		return result
+		if isTurnstileEmptyError(err.Error()) {
+			logger.LogInfo(ctx, fmt.Sprintf("Turnstile token required for %s, attempting to obtain via browser automation...", extractDomain(baseURL)))
+			turnstileToken := getTurnstileToken(ctx, baseURL)
+			if turnstileToken == "" {
+				result.Error = "Turnstile token required but could not be obtained"
+				return result
+			}
+			postResult, _, err = doCheckinRequestPostWithToken(ctx, checkinURL, token, cfg, hasConfig, baseURL, turnstileToken)
+			if err != nil {
+				result.Error = err.Error()
+				return result
+			}
+		} else {
+			result.Error = err.Error()
+			return result
+		}
 	}
 
 	message := strings.TrimSpace(postResult.Message)
+	if isTurnstileEmptyError(message) {
+		logger.LogInfo(ctx, fmt.Sprintf("Turnstile token required for %s, attempting to obtain via browser automation...", extractDomain(baseURL)))
+		turnstileToken := getTurnstileToken(ctx, baseURL)
+		if turnstileToken == "" {
+			result.Error = "Turnstile token required but could not be obtained"
+			return result
+		}
+		postResult, _, err = doCheckinRequestPostWithToken(ctx, checkinURL, token, cfg, hasConfig, baseURL, turnstileToken)
+		if err != nil {
+			result.Error = err.Error()
+			return result
+		}
+		message = strings.TrimSpace(postResult.Message)
+	}
 	if isAlreadyCheckedMessage(message) {
 		result.Success = true
 		result.AlreadyChecked = true
@@ -461,7 +508,7 @@ type checkinStatusResponse struct {
 }
 
 func doCheckinRequest(ctx context.Context, url, method, token string, cfg channelCheckinConfig, hasConfig bool, baseURL string) (*checkinStatusResponse, []byte, error) {
-	body, _, httpStatus, err := executeCheckinHTTP(ctx, url, method, token, cfg, hasConfig, baseURL)
+	body, _, httpStatus, err := executeCheckinHTTP(ctx, url, method, token, cfg, hasConfig, baseURL, nil)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -469,7 +516,7 @@ func doCheckinRequest(ctx context.Context, url, method, token string, cfg channe
 	// Check for Cloudflare block
 	if isCloudflareBlock(body, httpStatus) {
 		logger.LogInfo(ctx, fmt.Sprintf("Cloudflare block detected for %s, trying FlareSolverr...", extractDomain(baseURL)))
-		body, _, httpStatus, err = executeCheckinHTTPWithFlareSolverr(ctx, url, method, token, cfg, hasConfig, baseURL)
+		body, _, httpStatus, err = executeCheckinHTTPWithFlareSolverr(ctx, url, method, token, cfg, hasConfig, baseURL, nil)
 		if err != nil {
 			return nil, nil, fmt.Errorf("FlareSolverr retry failed: %w", err)
 		}
@@ -486,14 +533,14 @@ func doCheckinRequest(ctx context.Context, url, method, token string, cfg channe
 }
 
 func doCheckinRequestPost(ctx context.Context, url, token string, cfg channelCheckinConfig, hasConfig bool, baseURL string) (upstreamCheckinResponse, []byte, error) {
-	body, _, httpStatus, err := executeCheckinHTTP(ctx, url, http.MethodPost, token, cfg, hasConfig, baseURL)
+	body, _, httpStatus, err := executeCheckinHTTP(ctx, url, http.MethodPost, token, cfg, hasConfig, baseURL, nil)
 	if err != nil {
 		return upstreamCheckinResponse{}, nil, err
 	}
 
 	if isCloudflareBlock(body, httpStatus) {
 		logger.LogInfo(ctx, fmt.Sprintf("Cloudflare block on POST for %s, trying FlareSolverr...", extractDomain(baseURL)))
-		body, _, httpStatus, err = executeCheckinHTTPWithFlareSolverr(ctx, url, http.MethodPost, token, cfg, hasConfig, baseURL)
+		body, _, httpStatus, err = executeCheckinHTTPWithFlareSolverr(ctx, url, http.MethodPost, token, cfg, hasConfig, baseURL, nil)
 		if err != nil {
 			return upstreamCheckinResponse{}, nil, fmt.Errorf("FlareSolverr retry failed: %w", err)
 		}
@@ -518,8 +565,52 @@ func doCheckinRequestPost(ctx context.Context, url, token string, cfg channelChe
 	return postResult, body, nil
 }
 
-func executeCheckinHTTP(ctx context.Context, url, method, token string, cfg channelCheckinConfig, hasConfig bool, baseURL string) ([]byte, http.Header, int, error) {
-	req, err := http.NewRequestWithContext(ctx, method, url, nil)
+// doCheckinRequestPostWithToken performs a POST checkin with a Turnstile token in the request body.
+func doCheckinRequestPostWithToken(ctx context.Context, url, token string, cfg channelCheckinConfig, hasConfig bool, baseURL string, turnstileToken string) (upstreamCheckinResponse, []byte, error) {
+	payload := map[string]string{"turnstile_token": turnstileToken}
+	reqBody, err := common.Marshal(payload)
+	if err != nil {
+		return upstreamCheckinResponse{}, nil, fmt.Errorf("failed to marshal turnstile payload: %w", err)
+	}
+
+	body, _, httpStatus, err := executeCheckinHTTP(ctx, url, http.MethodPost, token, cfg, hasConfig, baseURL, reqBody)
+	if err != nil {
+		return upstreamCheckinResponse{}, nil, err
+	}
+
+	if isCloudflareBlock(body, httpStatus) {
+		logger.LogInfo(ctx, fmt.Sprintf("Cloudflare block on POST with token for %s, trying FlareSolverr...", extractDomain(baseURL)))
+		body, _, httpStatus, err = executeCheckinHTTPWithFlareSolverr(ctx, url, http.MethodPost, token, cfg, hasConfig, baseURL, reqBody)
+		if err != nil {
+			return upstreamCheckinResponse{}, nil, fmt.Errorf("FlareSolverr retry failed: %w", err)
+		}
+		if isCloudflareBlock(body, httpStatus) {
+			return upstreamCheckinResponse{}, nil, fmt.Errorf("still blocked by Cloudflare after FlareSolverr (status=%d)", httpStatus)
+		}
+	}
+
+	var postResult upstreamCheckinResponse
+	if len(strings.TrimSpace(string(body))) > 0 {
+		if err := common.Unmarshal(body, &postResult); err != nil {
+			return upstreamCheckinResponse{}, body, fmt.Errorf("invalid response: %v", err)
+		}
+	}
+	if httpStatus < http.StatusOK || httpStatus >= http.StatusMultipleChoices {
+		message := strings.TrimSpace(postResult.Message)
+		if message == "" {
+			message = fmt.Sprintf("HTTP %d", httpStatus)
+		}
+		return upstreamCheckinResponse{}, body, fmt.Errorf("%s", message)
+	}
+	return postResult, body, nil
+}
+
+func executeCheckinHTTP(ctx context.Context, url, method, token string, cfg channelCheckinConfig, hasConfig bool, baseURL string, body []byte) ([]byte, http.Header, int, error) {
+	var bodyReader io.Reader
+	if len(body) > 0 {
+		bodyReader = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -529,6 +620,9 @@ func executeCheckinHTTP(ctx context.Context, url, method, token string, cfg chan
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 	req.Header.Set("Accept", "application/json")
+	if len(body) > 0 {
+		req.Header.Set("Content-Type", "application/json")
+	}
 
 	resp, err := autoCheckinHTTPClient.Do(req)
 	if err != nil {
@@ -536,21 +630,25 @@ func executeCheckinHTTP(ctx context.Context, url, method, token string, cfg chan
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return nil, nil, 0, err
 	}
-	return body, resp.Header, resp.StatusCode, nil
+	return respBody, resp.Header, resp.StatusCode, nil
 }
 
-func executeCheckinHTTPWithFlareSolverr(ctx context.Context, url, method, token string, cfg channelCheckinConfig, hasConfig bool, baseURL string) ([]byte, http.Header, int, error) {
+func executeCheckinHTTPWithFlareSolverr(ctx context.Context, url, method, token string, cfg channelCheckinConfig, hasConfig bool, baseURL string, body []byte) ([]byte, http.Header, int, error) {
 	entry, err := flaresolverrSolve(ctx, baseURL)
 	if err != nil {
 		// Fall back to direct request
-		return executeCheckinHTTP(ctx, url, method, token, cfg, hasConfig, baseURL)
+		return executeCheckinHTTP(ctx, url, method, token, cfg, hasConfig, baseURL, body)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, url, nil)
+	var bodyReader io.Reader
+	if len(body) > 0 {
+		bodyReader = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -565,6 +663,9 @@ func executeCheckinHTTPWithFlareSolverr(ctx context.Context, url, method, token 
 	}
 	req.Header.Set("Cookie", entry.cookie)
 	req.Header.Set("Accept", "application/json")
+	if len(body) > 0 {
+		req.Header.Set("Content-Type", "application/json")
+	}
 
 	resp, err := autoCheckinHTTPClient.Do(req)
 	if err != nil {
@@ -572,11 +673,11 @@ func executeCheckinHTTPWithFlareSolverr(ctx context.Context, url, method, token 
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return nil, nil, 0, err
 	}
-	return body, resp.Header, resp.StatusCode, nil
+	return respBody, resp.Header, resp.StatusCode, nil
 }
 
 // isCloudflareBlock detects Cloudflare challenge pages in the response.
@@ -611,6 +712,142 @@ func isAlreadyCheckedMessage(message string) bool {
 		strings.Contains(message, "今天已经签到") ||
 		strings.Contains(message, "already checked") ||
 		strings.Contains(message, "already check")
+}
+
+func isTurnstileEmptyError(message string) bool {
+	s := strings.ToLower(message)
+	return strings.Contains(s, "turnstile token 为空") ||
+		strings.Contains(s, "turnstile token为空") ||
+		strings.Contains(s, "turnstile token is empty") ||
+		(strings.Contains(s, "turnstile token") && strings.Contains(s, "empty"))
+}
+
+func getTurnstileToken(ctx context.Context, baseURL string) string {
+	domain := extractDomain(baseURL)
+
+	turnstileCacheMu.RLock()
+	if entry, ok := turnstileCache[domain]; ok && time.Now().Before(entry.expiresAt) {
+		turnstileCacheMu.RUnlock()
+		return entry.token
+	}
+	turnstileCacheMu.RUnlock()
+
+	token, err := flaresolverrGetTurnstileToken(ctx, baseURL)
+	if err == nil && token != "" {
+		turnstileCacheMu.Lock()
+		turnstileCache[domain] = turnstileEntry{token: token, expiresAt: time.Now().Add(2 * time.Minute)}
+		turnstileCacheMu.Unlock()
+		logger.LogInfo(ctx, fmt.Sprintf("Obtained Turnstile token via FlareSolverr for %s", domain))
+		return token
+	}
+	if err != nil {
+		logger.LogInfo(ctx, fmt.Sprintf("FlareSolverr Turnstile extraction failed for %s: %v", domain, err))
+	}
+
+	return ""
+}
+
+// flaresolverrGetTurnstileToken uses FlareSolverr to navigate to the base URL
+// and extract the Cloudflare Turnstile token from the rendered page.
+func flaresolverrGetTurnstileToken(ctx context.Context, baseURL string) (string, error) {
+	fsURL := getFlareSolverrURL()
+	if !flaresolverrEnabled {
+		return "", errors.New("FlareSolverr not available")
+	}
+
+	pageURL := strings.TrimRight(baseURL, "/") + "/"
+	parsedURL, err := neturl.Parse(pageURL)
+	if err != nil {
+		return "", err
+	}
+	if parsedURL.Scheme != "" && parsedURL.Host != "" {
+		parsedURL.Path = "/"
+		parsedURL.RawQuery = ""
+		parsedURL.Fragment = ""
+		pageURL = parsedURL.String()
+	}
+
+	reqBody, err := common.Marshal(map[string]any{
+		"cmd":        "request.get",
+		"url":        pageURL,
+		"maxTimeout": 60000,
+	})
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fsURL+"/v1", bytes.NewReader(reqBody))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := (&http.Client{Timeout: 90 * time.Second}).Do(req)
+	if err != nil {
+		return "", fmt.Errorf("FlareSolverr request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
+		return "", err
+	}
+
+	var fsResp struct {
+		Status   string `json:"status"`
+		Solution struct {
+			TurnstileToken string `json:"turnstile_token"`
+			Response       string `json:"response"`
+			Status         int    `json:"status"`
+		} `json:"solution"`
+		Message string `json:"message"`
+	}
+	if err := common.Unmarshal(respBody, &fsResp); err != nil {
+		return "", fmt.Errorf("FlareSolverr response parse error: %w", err)
+	}
+	if fsResp.Status != "ok" {
+		return "", fmt.Errorf("FlareSolverr error: %s", fsResp.Message)
+	}
+
+	if fsResp.Solution.TurnstileToken != "" {
+		return fsResp.Solution.TurnstileToken, nil
+	}
+	token := extractTurnstileTokenFromHTML(fsResp.Solution.Response)
+	if token == "" {
+		return "", errors.New("turnstile token not found in FlareSolverr response")
+	}
+	return token, nil
+}
+
+// extractTurnstileTokenFromHTML searches for the cf-turnstile-response value in HTML.
+func extractTurnstileTokenFromHTML(html string) string {
+	if html == "" {
+		return ""
+	}
+	// Try multiple patterns
+	markers := []string{
+		`name="cf-turnstile-response" value="`,
+		`name='cf-turnstile-response' value='`,
+		`name=cf-turnstile-response value="`,
+		`data-cf-turnstile-response="`,
+	}
+	for _, marker := range markers {
+		idx := strings.Index(html, marker)
+		if idx < 0 {
+			continue
+		}
+		start := idx + len(marker)
+		end := strings.Index(html[start:], `"`)
+		if end < 0 {
+			end = strings.Index(html[start:], `'`)
+		}
+		if end > 0 && end < 512 {
+			token := html[start : start+end]
+			if len(token) > 10 { // Sanity check: Turnstile tokens are long
+				return token
+			}
+		}
+	}
+	return ""
 }
 
 func recordAutoCheckinResult(summary *AutoCheckinSummary, err error) {
