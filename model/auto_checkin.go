@@ -179,10 +179,11 @@ func runAutoCheckin(trigger string) (*AutoCheckinSummary, error) {
 		Order("id asc").
 		Find(&channels).Error
 	if err == nil {
+		configs := loadChannelCheckinConfigs()
 		summary.TotalChannels = len(channels)
 		summary.ChannelResults = make([]ChannelCheckinResult, 0, len(channels))
 		for _, channel := range channels {
-			result := checkinChannel(ctx, channel)
+			result := checkinChannel(ctx, channel, configs)
 			summary.ChannelResults = append(summary.ChannelResults, result)
 			switch {
 			case result.AlreadyChecked:
@@ -221,7 +222,22 @@ type upstreamCheckinResponse struct {
 	} `json:"data"`
 }
 
-func checkinChannel(ctx context.Context, channel Channel) ChannelCheckinResult {
+type channelCheckinConfig struct {
+	Session string `json:"session"`
+	UID     string `json:"uid"`
+}
+
+func loadChannelCheckinConfigs() map[int]channelCheckinConfig {
+	configs := make(map[int]channelCheckinConfig)
+	option := Option{}
+	if err := DB.Where("`key` = ?", "checkin_channel_configs").First(&option).Error; err != nil {
+		return configs
+	}
+	_ = common.UnmarshalJsonStr(option.Value, &configs)
+	return configs
+}
+
+func checkinChannel(ctx context.Context, channel Channel, configs map[int]channelCheckinConfig) ChannelCheckinResult {
 	baseURL := ""
 	if channel.BaseURL != nil {
 		baseURL = strings.TrimSpace(*channel.BaseURL)
@@ -229,26 +245,37 @@ func checkinChannel(ctx context.Context, channel Channel) ChannelCheckinResult {
 	result := ChannelCheckinResult{
 		ChannelID:   channel.Id,
 		ChannelName: channel.Name,
-		BaseURL:      baseURL,
+		BaseURL:     baseURL,
 	}
 
 	if baseURL == "" {
 		result.Error = "channel base URL is empty"
 		return result
 	}
-	key := strings.TrimSpace(channel.Key)
-	if key == "" {
-		result.Error = "channel key is empty"
-		return result
-	}
 
 	checkinURL := strings.TrimRight(baseURL, "/") + "/api/user/checkin"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, checkinURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, checkinURL, nil)
 	if err != nil {
 		result.Error = err.Error()
 		return result
 	}
-	req.Header.Set("Authorization", "Bearer "+key)
+
+	// Try session-based auth first (Cookie + New-Api-User)
+	cfg, hasSession := configs[channel.Id]
+	if hasSession && cfg.Session != "" && cfg.UID != "" {
+		req.Header.Set("Cookie", "session="+cfg.Session)
+		req.Header.Set("New-Api-User", cfg.UID)
+	} else {
+		// Fall back to Bearer token
+		key := strings.TrimSpace(channel.Key)
+		if key == "" {
+			result.Error = "no checkin credentials configured and channel key is empty"
+			return result
+		}
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	req.Header.Set("Accept", "application/json")
 
 	resp, err := autoCheckinHTTPClient.Do(req)
 	if err != nil {
@@ -263,30 +290,82 @@ func checkinChannel(ctx context.Context, channel Channel) ChannelCheckinResult {
 		return result
 	}
 
-	var upstream upstreamCheckinResponse
+	// Check if already checked in via GET status
+	var statusResp struct {
+		Success bool   `json:"success"`
+		Message string `json:"message"`
+		Data    struct {
+			Enabled bool `json:"enabled"`
+			Stats   struct {
+				CheckedInToday bool  `json:"checked_in_today"`
+				Records        []struct {
+					CheckinDate   string `json:"checkin_date"`
+					QuotaAwarded  int64  `json:"quota_awarded"`
+				} `json:"records"`
+			} `json:"stats"`
+		} `json:"data"`
+	}
 	if len(strings.TrimSpace(string(body))) > 0 {
-		if err := common.Unmarshal(body, &upstream); err != nil {
-			result.Error = fmt.Sprintf("invalid upstream response: %v", err)
+		_ = common.Unmarshal(body, &statusResp)
+	}
+
+	if statusResp.Data.Stats.CheckedInToday {
+		result.Success = true
+		result.AlreadyChecked = true
+		today := time.Now().Format("2006-01-02")
+		for _, rec := range statusResp.Data.Stats.Records {
+			if rec.CheckinDate == today {
+				result.QuotaAwarded = rec.QuotaAwarded
+				break
+			}
+		}
+		return result
+	}
+
+	// Not checked in yet, do POST checkin
+	postReq, err := http.NewRequestWithContext(ctx, http.MethodPost, checkinURL, nil)
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	postReq.Header = req.Header.Clone()
+
+	postResp, err := autoCheckinHTTPClient.Do(postReq)
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	defer postResp.Body.Close()
+
+	postBody, err := io.ReadAll(io.LimitReader(postResp.Body, 1<<20))
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+
+	var postResult upstreamCheckinResponse
+	if len(strings.TrimSpace(string(postBody))) > 0 {
+		if err := common.Unmarshal(postBody, &postResult); err != nil {
+			result.Error = fmt.Sprintf("invalid response: %v", err)
 			return result
 		}
 	}
 
-	result.QuotaAwarded = upstream.Data.QuotaAwarded
-	message := strings.TrimSpace(upstream.Message)
+	message := strings.TrimSpace(postResult.Message)
 	if isAlreadyCheckedMessage(message) {
 		result.Success = true
 		result.AlreadyChecked = true
-		result.Error = message
+		result.QuotaAwarded = postResult.Data.QuotaAwarded
 		return result
 	}
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+	if postResp.StatusCode < http.StatusOK || postResp.StatusCode >= http.StatusMultipleChoices {
 		if message == "" {
-			message = resp.Status
+			message = postResp.Status
 		}
 		result.Error = message
 		return result
 	}
-	if !upstream.Success {
+	if !postResult.Success {
 		if message == "" {
 			message = "upstream check-in failed"
 		}
@@ -295,6 +374,7 @@ func checkinChannel(ctx context.Context, channel Channel) ChannelCheckinResult {
 	}
 
 	result.Success = true
+	result.QuotaAwarded = postResult.Data.QuotaAwarded
 	return result
 }
 
