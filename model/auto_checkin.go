@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -66,7 +67,135 @@ var (
 	autoCheckinLastError   string
 	autoCheckinLive        atomic.Bool
 	autoCheckinHTTPClient  = &http.Client{Timeout: 30 * time.Second}
+
+	// FlareSolverr integration for bypassing Cloudflare Turnstile
+	flaresolverrURL     string
+	flaresolverrOnce    sync.Once
+	flaresolverrEnabled bool
+	// Cache cf_clearance cookies per domain (domain -> cookie header value)
+	cfClearanceCache   = make(map[string]cfClearanceEntry)
+	cfClearanceCacheMu sync.RWMutex
 )
+
+type cfClearanceEntry struct {
+	cookie    string
+	userAgent string
+	expiresAt time.Time
+}
+
+func getFlareSolverrURL() string {
+	flaresolverrOnce.Do(func() {
+		flaresolverrURL = strings.TrimRight(os.Getenv("FLARESOLVERR_URL"), "/")
+		if flaresolverrURL == "" {
+			flaresolverrURL = "http://flaresolverr:8191"
+		}
+		// Quick health check
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, flaresolverrURL+"/v1", nil)
+		if err == nil {
+			resp, err := http.DefaultClient.Do(req)
+			if err == nil {
+				resp.Body.Close()
+				flaresolverrEnabled = true
+				logger.LogInfo(context.Background(), fmt.Sprintf("FlareSolverr available at %s", flaresolverrURL))
+			}
+		}
+		if !flaresolverrEnabled {
+			logger.LogInfo(context.Background(), "FlareSolverr not available, Cloudflare bypass disabled")
+		}
+	})
+	return flaresolverrURL
+}
+
+// flaresolverrSolve navigates to the target URL via FlareSolverr to obtain cf_clearance cookies.
+func flaresolverrSolve(ctx context.Context, targetURL string) (*cfClearanceEntry, error) {
+	fsURL := getFlareSolverrURL()
+	if !flaresolverrEnabled {
+		return nil, errors.New("FlareSolverr not available")
+	}
+
+	// Check cache first
+	domain := extractDomain(targetURL)
+	cfClearanceCacheMu.RLock()
+	if entry, ok := cfClearanceCache[domain]; ok && time.Now().Before(entry.expiresAt) {
+		cfClearanceCacheMu.RUnlock()
+		return &entry, nil
+	}
+	cfClearanceCacheMu.RUnlock()
+
+	reqBody := fmt.Sprintf(`{"cmd":"request.get","url":"%s","maxTimeout":60000}`, targetURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fsURL+"/v1", strings.NewReader(reqBody))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := (&http.Client{Timeout: 90 * time.Second}).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("FlareSolverr request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse FlareSolverr response for cookies
+	var fsResp struct {
+		Status string `json:"status"`
+		Solution struct {
+			Headers    map[string]string `json:"headers"`
+			Cookies    []struct {
+				Name  string `json:"name"`
+				Value string `json:"value"`
+			} `json:"cookies"`
+			UserAgent string `json:"userAgent"`
+			Status    int    `json:"status"`
+		} `json:"solution"`
+		Message string `json:"message"`
+	}
+	if err := common.Unmarshal(body, &fsResp); err != nil {
+		return nil, fmt.Errorf("FlareSolverr response parse error: %w", err)
+	}
+	if fsResp.Status != "ok" {
+		return nil, fmt.Errorf("FlareSolverr error: %s", fsResp.Message)
+	}
+
+	// Build cookie string from FlareSolverr cookies
+	var cookies []string
+	for _, c := range fsResp.Solution.Cookies {
+		if c.Name == "cf_clearance" || c.Name == "__cf_bm" {
+			cookies = append(cookies, c.Name+"="+c.Value)
+		}
+	}
+	if len(cookies) == 0 {
+		return nil, fmt.Errorf("FlareSolverr returned no cf_clearance cookie (status=%d)", fsResp.Solution.Status)
+	}
+
+	entry := cfClearanceEntry{
+		cookie:    strings.Join(cookies, "; "),
+		userAgent: fsResp.Solution.UserAgent,
+		expiresAt: time.Now().Add(15 * time.Minute), // cache for 15 min
+	}
+
+	cfClearanceCacheMu.Lock()
+	cfClearanceCache[domain] = entry
+	cfClearanceCacheMu.Unlock()
+
+	logger.LogInfo(ctx, fmt.Sprintf("FlareSolverr solved challenge for %s", domain))
+	return &entry, nil
+}
+
+func extractDomain(rawURL string) string {
+	url := strings.TrimPrefix(rawURL, "https://")
+	url = strings.TrimPrefix(url, "http://")
+	if idx := strings.Index(url, "/"); idx >= 0 {
+		url = url[:idx]
+	}
+	return url
+}
 
 func StartAutoCheckinScheduler() {
 	autoCheckinOnce.Do(func() {
@@ -254,11 +383,6 @@ func checkinChannel(ctx context.Context, channel Channel, configs map[int]channe
 	}
 
 	checkinURL := strings.TrimRight(baseURL, "/") + "/api/user/checkin"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, checkinURL, nil)
-	if err != nil {
-		result.Error = err.Error()
-		return result
-	}
 
 	// Use access_token from config, fall back to channel key
 	cfg, hasConfig := configs[channel.Id]
@@ -272,46 +396,15 @@ func checkinChannel(ctx context.Context, channel Channel, configs map[int]channe
 		result.Error = "no checkin credentials configured and channel key is empty"
 		return result
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	if hasConfig && cfg.UserID != "" {
-		req.Header.Set("New-Api-User", cfg.UserID)
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-	req.Header.Set("Accept", "application/json")
 
-	resp, err := autoCheckinHTTPClient.Do(req)
-	if err != nil {
-		result.Error = err.Error()
-		return result
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	// Try GET status first, with FlareSolverr retry on Cloudflare block
+	statusResp, _, err := doCheckinRequest(ctx, checkinURL, http.MethodGet, token, cfg, hasConfig, baseURL)
 	if err != nil {
 		result.Error = err.Error()
 		return result
 	}
 
-	// Check if already checked in via GET status
-	var statusResp struct {
-		Success bool   `json:"success"`
-		Message string `json:"message"`
-		Data    struct {
-			Enabled bool `json:"enabled"`
-			Stats   struct {
-				CheckedInToday bool  `json:"checked_in_today"`
-				Records        []struct {
-					CheckinDate   string `json:"checkin_date"`
-					QuotaAwarded  int64  `json:"quota_awarded"`
-				} `json:"records"`
-			} `json:"stats"`
-		} `json:"data"`
-	}
-	if len(strings.TrimSpace(string(body))) > 0 {
-		_ = common.Unmarshal(body, &statusResp)
-	}
-
-	if statusResp.Data.Stats.CheckedInToday {
+	if statusResp != nil && statusResp.Data.Stats.CheckedInToday {
 		result.Success = true
 		result.AlreadyChecked = true
 		today := time.Now().Format("2006-01-02")
@@ -325,32 +418,10 @@ func checkinChannel(ctx context.Context, channel Channel, configs map[int]channe
 	}
 
 	// Not checked in yet, do POST checkin
-	postReq, err := http.NewRequestWithContext(ctx, http.MethodPost, checkinURL, nil)
+	postResult, _, err := doCheckinRequestPost(ctx, checkinURL, token, cfg, hasConfig, baseURL)
 	if err != nil {
 		result.Error = err.Error()
 		return result
-	}
-	postReq.Header = req.Header.Clone()
-
-	postResp, err := autoCheckinHTTPClient.Do(postReq)
-	if err != nil {
-		result.Error = err.Error()
-		return result
-	}
-	defer postResp.Body.Close()
-
-	postBody, err := io.ReadAll(io.LimitReader(postResp.Body, 1<<20))
-	if err != nil {
-		result.Error = err.Error()
-		return result
-	}
-
-	var postResult upstreamCheckinResponse
-	if len(strings.TrimSpace(string(postBody))) > 0 {
-		if err := common.Unmarshal(postBody, &postResult); err != nil {
-			result.Error = fmt.Sprintf("invalid response: %v", err)
-			return result
-		}
 	}
 
 	message := strings.TrimSpace(postResult.Message)
@@ -358,13 +429,6 @@ func checkinChannel(ctx context.Context, channel Channel, configs map[int]channe
 		result.Success = true
 		result.AlreadyChecked = true
 		result.QuotaAwarded = postResult.Data.QuotaAwarded
-		return result
-	}
-	if postResp.StatusCode < http.StatusOK || postResp.StatusCode >= http.StatusMultipleChoices {
-		if message == "" {
-			message = postResp.Status
-		}
-		result.Error = message
 		return result
 	}
 	if !postResult.Success {
@@ -378,6 +442,165 @@ func checkinChannel(ctx context.Context, channel Channel, configs map[int]channe
 	result.Success = true
 	result.QuotaAwarded = postResult.Data.QuotaAwarded
 	return result
+}
+
+// doCheckinRequest performs a GET request with automatic FlareSolverr retry on Cloudflare block.
+type checkinStatusResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+	Data    struct {
+		Enabled bool `json:"enabled"`
+		Stats   struct {
+			CheckedInToday bool `json:"checked_in_today"`
+			Records        []struct {
+				CheckinDate  string `json:"checkin_date"`
+				QuotaAwarded int64  `json:"quota_awarded"`
+			} `json:"records"`
+		} `json:"stats"`
+	} `json:"data"`
+}
+
+func doCheckinRequest(ctx context.Context, url, method, token string, cfg channelCheckinConfig, hasConfig bool, baseURL string) (*checkinStatusResponse, []byte, error) {
+	body, _, httpStatus, err := executeCheckinHTTP(ctx, url, method, token, cfg, hasConfig, baseURL)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Check for Cloudflare block
+	if isCloudflareBlock(body, httpStatus) {
+		logger.LogInfo(ctx, fmt.Sprintf("Cloudflare block detected for %s, trying FlareSolverr...", extractDomain(baseURL)))
+		body, _, httpStatus, err = executeCheckinHTTPWithFlareSolverr(ctx, url, method, token, cfg, hasConfig, baseURL)
+		if err != nil {
+			return nil, nil, fmt.Errorf("FlareSolverr retry failed: %w", err)
+		}
+		if isCloudflareBlock(body, httpStatus) {
+			return nil, nil, fmt.Errorf("still blocked by Cloudflare after FlareSolverr (status=%d)", httpStatus)
+		}
+	}
+
+	var statusResp checkinStatusResponse
+	if len(strings.TrimSpace(string(body))) > 0 {
+		_ = common.Unmarshal(body, &statusResp)
+	}
+	return &statusResp, body, nil
+}
+
+func doCheckinRequestPost(ctx context.Context, url, token string, cfg channelCheckinConfig, hasConfig bool, baseURL string) (upstreamCheckinResponse, []byte, error) {
+	body, _, httpStatus, err := executeCheckinHTTP(ctx, url, http.MethodPost, token, cfg, hasConfig, baseURL)
+	if err != nil {
+		return upstreamCheckinResponse{}, nil, err
+	}
+
+	if isCloudflareBlock(body, httpStatus) {
+		logger.LogInfo(ctx, fmt.Sprintf("Cloudflare block on POST for %s, trying FlareSolverr...", extractDomain(baseURL)))
+		body, _, httpStatus, err = executeCheckinHTTPWithFlareSolverr(ctx, url, http.MethodPost, token, cfg, hasConfig, baseURL)
+		if err != nil {
+			return upstreamCheckinResponse{}, nil, fmt.Errorf("FlareSolverr retry failed: %w", err)
+		}
+		if isCloudflareBlock(body, httpStatus) {
+			return upstreamCheckinResponse{}, nil, fmt.Errorf("still blocked by Cloudflare after FlareSolverr (status=%d)", httpStatus)
+		}
+	}
+
+	var postResult upstreamCheckinResponse
+	if len(strings.TrimSpace(string(body))) > 0 {
+		if err := common.Unmarshal(body, &postResult); err != nil {
+			return upstreamCheckinResponse{}, body, fmt.Errorf("invalid response: %v", err)
+		}
+	}
+	if httpStatus < http.StatusOK || httpStatus >= http.StatusMultipleChoices {
+		message := strings.TrimSpace(postResult.Message)
+		if message == "" {
+			message = fmt.Sprintf("HTTP %d", httpStatus)
+		}
+		return upstreamCheckinResponse{}, body, fmt.Errorf("%s", message)
+	}
+	return postResult, body, nil
+}
+
+func executeCheckinHTTP(ctx context.Context, url, method, token string, cfg channelCheckinConfig, hasConfig bool, baseURL string) ([]byte, http.Header, int, error) {
+	req, err := http.NewRequestWithContext(ctx, method, url, nil)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	if hasConfig && cfg.UserID != "" {
+		req.Header.Set("New-Api-User", cfg.UserID)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := autoCheckinHTTPClient.Do(req)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	return body, resp.Header, resp.StatusCode, nil
+}
+
+func executeCheckinHTTPWithFlareSolverr(ctx context.Context, url, method, token string, cfg channelCheckinConfig, hasConfig bool, baseURL string) ([]byte, http.Header, int, error) {
+	entry, err := flaresolverrSolve(ctx, baseURL)
+	if err != nil {
+		// Fall back to direct request
+		return executeCheckinHTTP(ctx, url, method, token, cfg, hasConfig, baseURL)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, url, nil)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	if hasConfig && cfg.UserID != "" {
+		req.Header.Set("New-Api-User", cfg.UserID)
+	}
+	if entry.userAgent != "" {
+		req.Header.Set("User-Agent", entry.userAgent)
+	} else {
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	}
+	req.Header.Set("Cookie", entry.cookie)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := autoCheckinHTTPClient.Do(req)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	return body, resp.Header, resp.StatusCode, nil
+}
+
+// isCloudflareBlock detects Cloudflare challenge pages in the response.
+func isCloudflareBlock(body []byte, statusCode int) bool {
+	if statusCode == 403 || statusCode == 503 {
+		s := strings.ToLower(string(body))
+		if strings.Contains(s, "cf-mitigated") ||
+			strings.Contains(s, "cloudflare") ||
+			strings.Contains(s, "challenge-platform") ||
+			strings.Contains(s, "turnstile") ||
+			strings.Contains(s, "cf_chl_opt") ||
+			strings.Contains(s, "just a moment") ||
+			strings.Contains(s, "checking your browser") {
+			return true
+		}
+	}
+	// Also check for HTML response when JSON was expected
+	if statusCode == 200 {
+		s := strings.ToLower(string(body))
+		if strings.Contains(s, "<!doctype html") && (strings.Contains(s, "cloudflare") || strings.Contains(s, "turnstile")) {
+			return true
+		}
+	}
+	return false
 }
 
 func isAlreadyCheckedMessage(message string) bool {
