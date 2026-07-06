@@ -142,7 +142,7 @@ export function CheckinSettingsSection({
     queryKey: AUTO_CHECKIN_STATUS_QUERY_KEY,
     queryFn: async () => {
       const res = await api.get<AutoCheckinStatusResponse>(
-        '/api/user/admin/auto-checkin/status'
+        '/api/user/auto-checkin/status'
       )
       return res.data.data
     },
@@ -151,7 +151,7 @@ export function CheckinSettingsSection({
   const triggerMutation = useMutation({
     mutationFn: async () => {
       const res = await api.post<AutoCheckinTriggerResponse>(
-        '/api/user/admin/auto-checkin/trigger',
+        '/api/user/auto-checkin/trigger',
         undefined,
         { skipBusinessError: true }
       )
