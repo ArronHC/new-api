@@ -133,8 +133,13 @@ function ChannelCheckinConfigCard() {
     queryKey: ['checkin-channel-configs'],
     queryFn: async () => {
       const res = await api.get('/api/option/')
-      const options = res.data?.data ?? {}
-      const val = options['checkin_channel_configs'] ?? '{}'
+      const options = res.data?.data ?? []
+      // options is [{key, value}, ...] from the API
+      const optionsByKey: Record<string, string> = {}
+      for (const opt of options) {
+        if (opt?.key) optionsByKey[opt.key] = opt.value ?? ''
+      }
+      const val = optionsByKey['checkin_channel_configs'] ?? '{}'
       try {
         return JSON.parse(typeof val === 'string' ? val : '{}') as Record<
           string,
