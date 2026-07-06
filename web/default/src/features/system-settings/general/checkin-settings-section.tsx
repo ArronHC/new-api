@@ -125,7 +125,7 @@ function ChannelCheckinConfigCard() {
     queryKey: ['channels-for-checkin'],
     queryFn: async () => {
       const res = await api.get('/api/channel/')
-      return (res.data?.data ?? []) as ChannelInfo[]
+      return (res.data?.data?.items ?? []) as ChannelInfo[]
     },
   })
 
