@@ -351,9 +351,22 @@ func runAutoCheckin(trigger string) (*AutoCheckinSummary, error) {
 		Find(&channels).Error
 	if err == nil {
 		configs := loadChannelCheckinConfigs()
-		summary.TotalChannels = len(channels)
-		summary.ChannelResults = make([]ChannelCheckinResult, 0, len(channels))
+		// Only channels with both user_id and access_token configured are
+		// eligible for auto check-in. Newly added channels still appear as
+		// candidates (configured via the settings UI) but are skipped here
+		// until both credentials are provided, so they are neither checked
+		// in nor surfaced in the status output.
+		eligible := make([]Channel, 0, len(channels))
 		for _, channel := range channels {
+			cfg, ok := configs[channel.Id]
+			if !ok || strings.TrimSpace(cfg.UserID) == "" || strings.TrimSpace(cfg.AccessToken) == "" {
+				continue
+			}
+			eligible = append(eligible, channel)
+		}
+		summary.TotalChannels = len(eligible)
+		summary.ChannelResults = make([]ChannelCheckinResult, 0, len(eligible))
+		for _, channel := range eligible {
 			result := checkinChannel(ctx, channel, configs)
 			summary.ChannelResults = append(summary.ChannelResults, result)
 			switch {
@@ -426,18 +439,15 @@ func checkinChannel(ctx context.Context, channel Channel, configs map[int]channe
 
 	checkinURL := strings.TrimRight(baseURL, "/") + "/api/user/checkin"
 
-	// Use access_token from config, fall back to channel key
+	// The credentials come exclusively from the per-channel config. The
+	// channel key is no longer used as a fallback, so channels without both
+	// user_id and access_token configured are never checked in.
 	cfg, hasConfig := configs[channel.Id]
-	token := ""
-	if hasConfig && cfg.AccessToken != "" {
-		token = cfg.AccessToken
-	} else {
-		token = strings.TrimSpace(channel.Key)
-	}
-	if token == "" {
-		result.Error = "no checkin credentials configured and channel key is empty"
+	if !hasConfig || strings.TrimSpace(cfg.UserID) == "" || strings.TrimSpace(cfg.AccessToken) == "" {
+		result.Error = "no checkin credentials configured"
 		return result
 	}
+	token := strings.TrimSpace(cfg.AccessToken)
 
 	// Try GET status first, with FlareSolverr retry on Cloudflare block
 	statusResp, _, err := doCheckinRequest(ctx, checkinURL, http.MethodGet, token, cfg, hasConfig, baseURL)

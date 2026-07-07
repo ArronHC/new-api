@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -69,6 +70,12 @@ func TestAutoCheckinAllChannelsChecksActiveUpstreamChannels(t *testing.T) {
 	require.NoError(t, DB.Create(&Channel{Id: 2, Name: "already", Key: "already-token", BaseURL: &baseURL, Status: common.ChannelStatusEnabled}).Error)
 	require.NoError(t, DB.Create(&Channel{Id: 3, Name: "failed", Key: "failed-token", BaseURL: &baseURL, Status: common.ChannelStatusEnabled}).Error)
 	require.NoError(t, DB.Create(&Channel{Id: 4, Name: "disabled", Key: "success-token", BaseURL: &baseURL, Status: common.ChannelStatusManuallyDisabled}).Error)
+	// Channel 5 is enabled but has no credentials configured: it must be a
+	// candidate (loaded) but skipped — not checked in, not in the status list.
+	require.NoError(t, DB.Create(&Channel{Id: 5, Name: "no-creds", Key: "success-token", BaseURL: &baseURL, Status: common.ChannelStatusEnabled}).Error)
+
+	// Only channels with both user_id and access_token configured are eligible.
+	require.NoError(t, DB.Create(&Option{Key: "checkin_channel_configs", Value: `{"1":{"user_id":"u1","access_token":"success-token"},"2":{"user_id":"u2","access_token":"already-token"},"3":{"user_id":"u3","access_token":"failed-token"}}`}).Error)
 
 	summary, err := AutoCheckinAllChannels()
 	require.NoError(t, err)
@@ -77,6 +84,10 @@ func TestAutoCheckinAllChannelsChecksActiveUpstreamChannels(t *testing.T) {
 	assert.Equal(t, 1, summary.ChannelsAlreadyChecked)
 	assert.Equal(t, 1, summary.ChannelsFailed)
 	require.Len(t, summary.ChannelResults, 3)
+
+	for _, r := range summary.ChannelResults {
+		assert.NotEqual(t, 5, r.ChannelID, "channel without credentials must not appear in status list")
+	}
 
 	assert.Equal(t, ChannelCheckinResult{
 		ChannelID:    1,
@@ -145,6 +156,48 @@ func TestAutoCheckinWithSessionConfig(t *testing.T) {
 	require.Len(t, summary.ChannelResults, 1)
 	assert.True(t, summary.ChannelResults[0].Success)
 	assert.Equal(t, int64(5678), summary.ChannelResults[0].QuotaAwarded)
+}
+
+func TestAutoCheckinSkipsChannelsWithoutBothCredentials(t *testing.T) {
+	truncateTables(t)
+
+	setting := operation_setting.GetCheckinSetting()
+	original := *setting
+	t.Cleanup(func() {
+		*setting = original
+	})
+	setting.Enabled = true
+
+	// Track whether the upstream checkin endpoint is hit; channels without
+	// both credentials must never reach it.
+	var hits int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		atomic.AddInt32(&hits, 1)
+		_, _ = w.Write([]byte(`{"success":true,"data":{"enabled":true,"stats":{"checked_in_today":false}}}`))
+	}))
+	t.Cleanup(server.Close)
+
+	baseURL := server.URL
+	require.NoError(t, DB.Create(&Channel{Id: 100, Name: "both", BaseURL: &baseURL, Status: common.ChannelStatusEnabled}).Error)
+	require.NoError(t, DB.Create(&Channel{Id: 101, Name: "user-id-only", BaseURL: &baseURL, Status: common.ChannelStatusEnabled}).Error)
+	require.NoError(t, DB.Create(&Channel{Id: 102, Name: "access-token-only", BaseURL: &baseURL, Status: common.ChannelStatusEnabled}).Error)
+	require.NoError(t, DB.Create(&Channel{Id: 103, Name: "no-config", BaseURL: &baseURL, Status: common.ChannelStatusEnabled}).Error)
+
+	require.NoError(t, DB.Create(&Option{Key: "checkin_channel_configs", Value: `{"100":{"user_id":"u100","access_token":"tok-100"},"101":{"user_id":"u101","access_token":""},"102":{"user_id":"","access_token":"tok-102"}}`}).Error)
+
+	summary, err := AutoCheckinAllChannels()
+	require.NoError(t, err)
+	assert.Equal(t, 1, summary.TotalChannels, "only the channel with both credentials is eligible")
+	require.Len(t, summary.ChannelResults, 1)
+	assert.Equal(t, 100, summary.ChannelResults[0].ChannelID)
+
+	for _, r := range summary.ChannelResults {
+		assert.NotEqual(t, 101, r.ChannelID)
+		assert.NotEqual(t, 102, r.ChannelID)
+		assert.NotEqual(t, 103, r.ChannelID)
+	}
+	assert.Equal(t, int32(2), atomic.LoadInt32(&hits), "eligible channel should perform status and check-in requests only")
 }
 
 func TestGetTurnstileTokenExtractsSolutionTokenAndCachesByDomain(t *testing.T) {
@@ -289,6 +342,7 @@ func TestAutoCheckinRetriesPostWithTurnstileToken(t *testing.T) {
 
 	baseURL := upstream.URL
 	require.NoError(t, DB.Create(&Channel{Id: 20, Name: "turnstile", Key: "test-token", BaseURL: &baseURL, Status: common.ChannelStatusEnabled}).Error)
+	require.NoError(t, DB.Create(&Option{Key: "checkin_channel_configs", Value: `{"20":{"user_id":"u20","access_token":"test-token"}}`}).Error)
 
 	summary, err := AutoCheckinAllChannels()
 	require.NoError(t, err)
